@@ -325,19 +325,52 @@ def _send_to_claude_app(text):
 
 
 def _send_macos(text):
-    """macOS: AppleScript to activate Claude, paste, enter."""
+    """macOS: write prompt to temp file, then use AppleScript to paste into Claude."""
+    import tempfile
+
+    # Write to temp file for large prompts (clipboard can truncate)
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
+    tmp.write(text)
+    tmp.close()
+    tmp_path = tmp.name
+
+    # Copy to clipboard
     subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+
+    # AppleScript: activate Claude, wait, click input area, paste, send
     script = '''
     tell application "Claude" to activate
-    delay 0.5
+    delay 1.0
+
     tell application "System Events"
-        keystroke "v" using command down
-        delay 0.3
-        keystroke return
+        tell process "Claude"
+            -- Make sure the window is frontmost
+            set frontmost to true
+            delay 0.3
+
+            -- Press Cmd+A to select any existing text, then delete it
+            keystroke "a" using command down
+            delay 0.1
+            key code 51  -- backspace
+            delay 0.2
+
+            -- Paste from clipboard
+            keystroke "v" using command down
+            delay 0.5
+
+            -- Press Enter to send
+            keystroke return
+        end tell
     end tell
     '''
     result = subprocess.run(["osascript", "-e", script],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=15)
+
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+
     if result.returncode != 0:
         raise RuntimeError(f"AppleScript failed: {result.stderr.strip()}")
 
