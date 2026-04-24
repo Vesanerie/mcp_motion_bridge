@@ -1,5 +1,5 @@
 bl_info = {
-    "name": "Video Mocap MCP",
+    "name": "MCP_Motion_Bridge",
     "author": "You",
     "version": (0, 8, 0),
     "blender": (3, 6, 0),
