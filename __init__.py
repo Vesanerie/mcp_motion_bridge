@@ -419,9 +419,12 @@ def _pipeline_tick():
     steps = _pipe["steps"]
     idx = _pipe["step_idx"]
 
-    _debug_log(f"TICK: idx={idx}, total_steps={len(steps)}, "
-               f"last_sent_marker='{_pipe['last_sent_marker']}', "
-               f"scene_marker='{scene.get('vmmcp_step_done', '')}'")
+    done_check = ""
+    if _pipe["last_sent_marker"]:
+        done_check = os.path.join(_steps_dir(), f"{_pipe['last_sent_marker']}.done")
+    _debug_log(f"TICK: idx={idx}, total={len(steps)}, "
+               f"marker='{_pipe['last_sent_marker']}', "
+               f"done_file_exists={os.path.isfile(done_check) if done_check else 'N/A'}")
 
     # All steps sent and confirmed?
     if idx > len(steps):
@@ -432,18 +435,17 @@ def _pipeline_tick():
 
     # Waiting for the current step to finish?
     if _pipe["last_sent_marker"]:
-        scene_marker = scene.get("vmmcp_step_done", "")
-        if scene_marker != _pipe["last_sent_marker"]:
+        done_file = os.path.join(_steps_dir(), f"{_pipe['last_sent_marker']}.done")
+        if not os.path.isfile(done_file):
             elapsed = time.time() - _pipe["last_activity"]
-            _debug_log(f"TICK: waiting for marker '{_pipe['last_sent_marker']}', "
-                       f"scene has '{scene_marker}', elapsed={elapsed:.0f}s")
+            _debug_log(f"TICK: waiting for file '{done_file}', elapsed={elapsed:.0f}s")
             props.pipeline_status = (
-                f"Step {idx}/{len(steps)} — waiting for '{_pipe['last_sent_marker']}' "
+                f"Step {idx}/{len(steps)} — waiting for Claude "
                 f"({elapsed:.0f}s)"
             )
             return 3.0
         else:
-            _debug_log(f"TICK: marker '{_pipe['last_sent_marker']}' CONFIRMED!")
+            _debug_log(f"TICK: signal file found! '{_pipe['last_sent_marker']}' CONFIRMED!")
             _pipe["last_activity"] = time.time()
             _pipe["last_sent_marker"] = ""
 
@@ -461,8 +463,6 @@ def _pipeline_tick():
 
     step_path = _write_step_file(idx, marker, label, full_prompt)
     _debug_log(f"TICK: wrote step file {step_path}")
-
-    scene["vmmcp_step_done"] = ""
 
     msg = f"Read and execute the prompt in {step_path}"
     _debug_log(f"TICK: sending to terminal: {msg}")
@@ -535,16 +535,19 @@ def _build_steps(videos, props):
     single_file_mode = "_single_file" in videos
     layout = videos.get("_layout", "AUTO") if single_file_mode else "N/A"
 
+    steps_dir = _steps_dir()
+
     def wrap(marker, label, body):
+        done_file = os.path.join(steps_dir, f"{marker}.done")
         return (marker, label,
             f"=== {label} ===\n"
             "Execute ONLY this step. Do NOT start any other step.\n\n"
             + body +
-            f"\nWhen this step is FULLY COMPLETE, you MUST execute this command "
-            f"via BlenderMCP as the very last action:\n"
-            f"  bpy.context.scene['vmmcp_step_done'] = '{marker}'\n"
-            f"This signals the addon that you are done. Do NOT run this command "
-            f"until the step is truly finished.\n"
+            f"\nWhen this step is FULLY COMPLETE, create this signal file "
+            f"as the very last action:\n"
+            f"  Write the word 'done' to: {done_file}\n"
+            f"  (e.g. run: echo done > '{done_file}')\n"
+            f"Do NOT create this file until the step is truly finished.\n"
         )
 
     steps = []
@@ -736,7 +739,6 @@ class VMMCP_OT_launch(Operator):
 
         # Clear old files
         _clear_steps_dir()
-        context.scene["vmmcp_step_done"] = ""
         steps_dir = _steps_dir()
 
         # Write first step
@@ -803,7 +805,6 @@ class VMMCP_OT_reset(Operator):
         _pipe["steps"] = []
         _pipe["context_text"] = ""
         _pipe["last_sent_marker"] = ""
-        context.scene["vmmcp_step_done"] = ""
         props.pipeline_status = ""
 
         mesh_obj = bpy.data.objects.get(props.mesh_object)
