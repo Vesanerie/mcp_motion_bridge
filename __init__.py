@@ -274,6 +274,17 @@ def _steps_dir():
     return d
 
 
+def _debug_log(msg):
+    """Append a timestamped line to VMMCP_Steps/debug.log"""
+    d = _steps_dir()
+    log_path = os.path.join(d, "debug.log")
+    ts = time.strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}\n"
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(line)
+    print(f"[VMMCP] {line.strip()}")  # also print to Blender console
+
+
 def _clear_steps_dir():
     d = _steps_dir()
     for f in os.listdir(d):
@@ -355,9 +366,11 @@ def _launch_claude_terminal(work_dir, first_msg):
 def _send_msg_to_terminal(msg):
     """Send a message to the Claude terminal via clipboard paste. Non-blocking."""
     import sys
+    _debug_log(f"SEND: platform={sys.platform}, msg_len={len(msg)}")
     if sys.platform == "darwin":
-        # pbcopy is fast and non-blocking enough
-        subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE).communicate(msg.encode("utf-8"))
+        proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+        proc.communicate(msg.encode("utf-8"))
+        _debug_log(f"SEND: pbcopy done, returncode={proc.returncode}")
         script = (
             'tell application "Terminal"\n'
             '    activate\n'
@@ -373,7 +386,8 @@ def _send_msg_to_terminal(msg):
             '    end tell\n'
             'end tell'
         )
-        subprocess.Popen(["osascript", "-e", script])
+        proc = subprocess.Popen(["osascript", "-e", script])
+        _debug_log(f"SEND: osascript launched, pid={proc.pid}")
     elif sys.platform == "win32":
         ps = (
             'Add-Type -AssemblyName System.Windows.Forms\n'
@@ -390,15 +404,14 @@ def _send_msg_to_terminal(msg):
 
 
 def _pipeline_tick():
-    """Blender timer — polls marker every 3 seconds, auto-advances steps.
-    Runs ONLY in the main thread. No threading, no locks needed.
-    Returns float to keep ticking, None to stop.
-    """
+    """Blender timer — polls marker every 3 seconds, auto-advances steps."""
     if not _pipe["running"]:
+        _debug_log("TICK: pipeline not running, stopping timer")
         return None
 
     scene = bpy.data.scenes.get(_pipe["scene_name"])
     if scene is None:
+        _debug_log(f"TICK: scene '{_pipe['scene_name']}' not found, stopping")
         _pipe["running"] = False
         return None
 
@@ -406,8 +419,13 @@ def _pipeline_tick():
     steps = _pipe["steps"]
     idx = _pipe["step_idx"]
 
+    _debug_log(f"TICK: idx={idx}, total_steps={len(steps)}, "
+               f"last_sent_marker='{_pipe['last_sent_marker']}', "
+               f"scene_marker='{scene.get('vmmcp_step_done', '')}'")
+
     # All steps sent and confirmed?
     if idx > len(steps):
+        _debug_log("TICK: all steps done, stopping")
         _pipe["running"] = False
         props.pipeline_status = f"Pipeline complete — {len(steps)} steps done!"
         return None
@@ -416,21 +434,23 @@ def _pipeline_tick():
     if _pipe["last_sent_marker"]:
         scene_marker = scene.get("vmmcp_step_done", "")
         if scene_marker != _pipe["last_sent_marker"]:
-            # Still waiting — check for stall (no scene changes at all)
+            elapsed = time.time() - _pipe["last_activity"]
+            _debug_log(f"TICK: waiting for marker '{_pipe['last_sent_marker']}', "
+                       f"scene has '{scene_marker}', elapsed={elapsed:.0f}s")
             props.pipeline_status = (
-                f"Step {idx}/{len(steps)} — waiting for Claude to set marker "
-                f"'{_pipe['last_sent_marker']}'..."
+                f"Step {idx}/{len(steps)} — waiting for '{_pipe['last_sent_marker']}' "
+                f"({elapsed:.0f}s)"
             )
             return 3.0
         else:
-            # Marker confirmed! Log activity time
+            _debug_log(f"TICK: marker '{_pipe['last_sent_marker']}' CONFIRMED!")
             _pipe["last_activity"] = time.time()
             _pipe["last_sent_marker"] = ""
-            # Fall through to send next step
 
     # Are there more steps?
     if idx >= len(steps):
-        _pipe["step_idx"] = idx + 1  # trigger completion on next tick
+        _debug_log("TICK: no more steps, completing")
+        _pipe["step_idx"] = idx + 1
         _pipe["running"] = False
         props.pipeline_status = f"Pipeline complete — {len(steps)} steps done!"
         return None
@@ -439,23 +459,22 @@ def _pipeline_tick():
     marker, label, step_text = steps[idx]
     full_prompt = _pipe["context_text"] + "\n\n" + step_text
 
-    # Write step file
     step_path = _write_step_file(idx, marker, label, full_prompt)
+    _debug_log(f"TICK: wrote step file {step_path}")
 
-    # Clear marker BEFORE sending
     scene["vmmcp_step_done"] = ""
 
-    # Send instruction to Claude terminal
     msg = f"Read and execute the prompt in {step_path}"
+    _debug_log(f"TICK: sending to terminal: {msg}")
     _send_msg_to_terminal(msg)
 
-    # Update state
     _pipe["step_idx"] = idx + 1
     _pipe["last_sent_marker"] = marker
     _pipe["last_activity"] = time.time()
     props.pipeline_status = f"Step {idx + 1}/{len(steps)}: {label} — running..."
+    _debug_log(f"TICK: step {idx + 1} '{label}' sent, waiting for '{marker}'")
 
-    return 3.0  # check again in 3 seconds
+    return 3.0
 
 
 # ------------------------------------------------------------------
@@ -737,9 +756,16 @@ class VMMCP_OT_launch(Operator):
 
         # Launch terminal
         first_msg = f"Read and execute the prompt in {first_path}"
+        _debug_log(f"LAUNCH: steps_dir={steps_dir}")
+        _debug_log(f"LAUNCH: first_path={first_path}")
+        _debug_log(f"LAUNCH: first_msg={first_msg}")
+        _debug_log(f"LAUNCH: steps count={len(steps)}")
+        _debug_log(f"LAUNCH: markers={[s[0] for s in steps]}")
         try:
             _launch_claude_terminal(steps_dir, first_msg)
+            _debug_log("LAUNCH: terminal opened OK")
         except Exception as exc:
+            _debug_log(f"LAUNCH: terminal FAILED: {exc}")
             context.window_manager.clipboard = first_msg
             props.pipeline_status = f"Terminal failed — paste clipboard in Claude Code"
             self.report({"WARNING"}, f"Terminal failed ({exc}), instruction in clipboard")
