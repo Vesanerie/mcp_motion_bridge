@@ -1,174 +1,157 @@
 # Video Mocap MCP - Blender add-on
 
-Add-on Blender pour preparer une scene de rigging/animation pilotee par Claude
-via BlenderMCP.
+Add-on Blender pour la capture de mouvement video pilotee par Claude via
+BlenderMCP.
 
 BlenderMCP est indispensable. MCP_motion_bridge ne peut pas fonctionner seul :
 il prepare le contexte et les requetes, mais Claude doit executer les actions
 dans Blender via BlenderMCP.
 
-Le but n'est pas de faire une mocap MediaPipe locale. Le flux attendu est :
+## Architecture
 
-```text
-Videos / image sequence
-        +
-Mesh Blender
-        +
-6 cameras d'analyse: top, bottom, front, back, left, right
-        |
-        v
-Video Mocap MCP add-on
-        |
-        v
-Requete structuree pour Claude / BlenderMCP
-        |
-        v
-Claude inspecte la scene Blender, cree le rig, puis anime les memes bones
+```
+Video source (YouTube, film, danse, sport)
+       |
+       v
+estimator/run_smpl.py  (Python externe, TRAM ou 4D-Humans)
+       |
+       v
+motion_data.npz  (24 joints x rotations axis-angle + translation + shape)
+       |
+       v
+__init__.py  (addon Blender, genere requete MCP structuree)
+       |
+       v
+Claude via BlenderMCP
+  1. Rig Mesh : inspecte mesh + 6 cameras, cree armature SMPL-compatible
+  2. Animate  : lit rotations SMPL, retarget sur le rig, verif multi-angle
 ```
 
-## Pipeline
+## Arbre de decision : quel estimateur utiliser ?
 
-### 1. Rig Mesh
+| Situation | Estimateur | Raison |
+|-----------|------------|--------|
+| Video quelconque (YouTube, film, sport, camera mobile) | **TRAM** (obligatoire) | Etat de l'art ECCV 2024, SLAM camera |
+| Video simple (camera fixe, eclairage controle) | **4D-Humans (HMR2)** | Plus leger, bon pour poses statiques |
+| Test rapide, video tres courte, pas besoin de precision | **MediaPipe** (fallback degrade) | 33 landmarks, z bruite |
 
-Le bouton `Rig Mesh` :
+## Pourquoi SMPL et pas MediaPipe ?
 
-- prend le mesh choisi dans le panneau `Mocap`;
-- cree ou met a jour les cameras `VMMCP_FRONT_Camera`,
-  `VMMCP_BACK_Camera`, `VMMCP_LEFT_Camera`, `VMMCP_RIGHT_Camera`,
-  `VMMCP_TOP_Camera`, `VMMCP_BOTTOM_Camera`;
-- collecte les infos utiles du mesh : vertex count, polygons, bounding box,
-  transforms, modifiers, materials, shape keys;
-- transmet a Claude le type de rig cible et le nombre de bones demande;
-- genere une requete MCP dans un text block Blender nomme
-  `VMMCP_Rig_Mesh_Request`;
-- copie aussi cette requete dans le presse-papiers;
-- exporte cette requete en `.txt` pour pouvoir la coller plus tard dans une
-  nouvelle conversation Claude.
+MediaPipe Pose extrait 33 keypoints independants. Problemes :
+- Le Z (profondeur) est tres bruite depuis une seule camera
+- Les longueurs d'os "respirent" (varient de ~5% par frame)
+- Pas de rotations : il faut les deduire des positions, fragile
+- Poses anatomiquement impossibles non filtrees
 
-Cette requete demande a Claude, via BlenderMCP, d'inspecter le mesh et les six
-vues camera, puis de creer une armature adaptee au mesh. Le mesh doit etre lie
-aux bones crees, avec des controles utilisables quand c'est pertinent.
+SMPL (Skinned Multi-Person Linear Model) resout tout ca :
+- Sortie directe en rotations d'articulations (24 joints)
+- Modele parametrique : longueurs d'os constantes par construction
+- Contraintes anatomiques integrees
+- Les rotations sont exactement ce que consomme un rig Blender
+
+## Prerequis
+
+### Python externe (estimateur SMPL)
+
+L'estimateur tourne dans un process Python separe (pas dans Blender).
+
+```bash
+python3.11 -m venv ~/smpl_env
+source ~/smpl_env/bin/activate
+
+# PyTorch (adapte a ton GPU/CPU)
+pip install torch torchvision
+
+# TRAM (recommande — meilleure qualite)
+git clone https://github.com/yufu-wang/tram
+cd tram && pip install -e .
+
+# OU 4D-Humans (alternative plus legere)
+pip install hmr2
+
+# Dependencies communes
+pip install opencv-python numpy scipy
+```
+
+### Blender
+- Blender 3.6+ (teste 4.x)
+- BlenderMCP installe et fonctionnel (https://github.com/ahujasid/blender-mcp)
+
+## Installation de l'addon
+
+1. Zipper le dossier avec `__init__.py` + `estimator/` :
+   ```bash
+   zip -r video_mocap_mcp.zip video_mocap_mcp/
+   ```
+2. Blender → Edit → Preferences → Add-ons → Install → choisir le zip
+3. Dans View3D, onglet `Mocap` de la sidebar (touche N)
+
+## Pipeline SMPL (recommande)
+
+1. **Mesh** : selectionner le mesh a animer
+2. **Video** : chemin vers la video source du mouvement
+3. **Method** : SMPL (TRAM/HMR2)
+4. **External Python** : chemin vers le Python avec TRAM/HMR2
+5. **Rig Target** : SMPL 24-joint (pour correspondance directe)
+6. **Extract Motion** : lance l'estimateur, produit un `.npz`
+7. **Rig Mesh** : genere la requete MCP → coller dans Claude
+8. Claude cree l'armature via BlenderMCP
+9. **Animate** : genere la requete MCP → coller dans Claude
+10. Claude applique les rotations SMPL au rig
 
 ## Nombre de bones
 
-L'utilisateur choisit :
+| Rig Target | Bones | Usage |
+|------------|-------|-------|
+| SMPL 24-joint | 24 | Correspondance directe SMPL (recommande) |
+| Custom | 65 | General, a ajuster |
+| Rigify | 80-120 | Blender avec controles FK/IK |
+| Unreal | 50-70 | Export game engine |
 
-- `Rig Target` : `Custom`, `Rigify` ou `Unreal`;
-- `Bones` : nombre de bones cible pour l'armature.
+## Role des 6 cameras
 
-Le nombre de bones est transmis a Claude comme une contrainte de production.
-Claude peut l'ajuster legerement si la topologie du mesh l'exige, mais la
-requete lui demande de respecter l'intention.
+Les cameras VMMCP_* ne font PAS de stereo sur la video source
+(la video est monoculaire). Elles servent a :
 
-Guide de base :
+1. Donner a Claude un contexte visuel du mesh Blender pour le rigging
+2. Verifier l'animation depuis chaque angle apres application
+3. Detecter les contradictions (bras qui traverse le torse vu de profil)
 
-| Usage | Recommandation |
-|-------|----------------|
-| Prop simple ou objet rigide | 8-25 bones |
-| Humanoide Unreal / game engine | 50-70 deformation bones |
-| Humanoide Rigify | 80-120 bones, controles inclus |
-| Creature ou personnage complexe | 90-180 bones selon l'anatomie |
-| Visage/mains tres detailles | 120+ bones ou combinaison bones + shape keys |
+## Pieges geres dans les requetes MCP
 
-Pour Unreal, privilegier une hierarchie stable, un root clair, un pelvis separe,
-et des noms compatibles export. Pour Rigify, privilegier des controles FK/IK
-propres et une deformation anatomiquement coherente.
+Les requetes generees pour Claude mentionnent explicitement :
 
-### 2. Animate
-
-Le bouton `Animate` :
-
-- reprend le meme mesh;
-- utilise les videos ou la suite d'images fournies dans le panneau;
-- cree ou met a jour le setup camera si l'option est active;
-- genere une requete MCP dans `VMMCP_Animate_Request`;
-- copie la requete dans le presse-papiers;
-- exporte cette requete en `.txt`.
-
-Cette requete demande a Claude d'analyser les references video/image et
-d'animer le rig existant sur la plage de frames choisie. L'animation doit etre
-bakee sur les bones du rig du mesh, pas sur une armature separee.
-
-La requete d'animation impose aussi deux regles :
-
-- les objets, personnages, accessoires, decors ou mouvements qui ne sont pas
-  presents dans les references fournies doivent etre ignores;
-- Claude doit comparer les poses animees avec chaque angle disponible
-  (`front`, `back`, `left`, `right`, `top`, `bottom`) depuis les cameras
-  `VMMCP_*`, puis corriger la pose si un angle contredit un autre.
-
-## Sauvegarde de la requete
-
-Les boutons `Rig Mesh` et `Animate` creent un prompt complet pret a coller dans
-une nouvelle conversation Claude. Ce prompt rappelle a Claude qu'il doit etre
-connecte a Blender via BlenderMCP avant d'executer le travail.
-
-L'add-on garde trois copies de la derniere requete :
-
-- dans le presse-papiers;
-- dans un text block Blender (`VMMCP_Rig_Mesh_Request` ou
-  `VMMCP_Animate_Request`);
-- dans un fichier `.txt`.
-
-Le bouton `Copy Request to txt` reexporte manuellement la derniere requete si
-l'utilisateur a ferme ou oublie d'ouvrir une conversation Claude.
-
-## Utilisation
-
-1. Installer et activer BlenderMCP. C'est obligatoire.
-2. Installer cet add-on dans Blender.
-3. Ouvrir la scene contenant le mesh a rigger.
-4. Dans `View3D > Sidebar > Mocap`, choisir le mesh.
-5. Choisir `Rig Target` et le nombre de `Bones`.
-6. Renseigner les sources disponibles :
-   - `Front`
-   - `Back`
-   - `Left`
-   - `Right`
-   - `Top`
-   - `Bottom`
-   - ou `Image Sequence`
-7. Cliquer sur `Rig Mesh`.
-8. Envoyer la requete generee a Claude dans la conversation connectee a
-   BlenderMCP.
-9. Une fois le rig cree, cliquer sur `Animate`.
-10. Envoyer la seconde requete a Claude.
+1. **Coordinate system** : SMPL Y-up → Blender Z-up (via scipy)
+2. **Rest pose mismatch** : SMPL T-pose vs rig custom → offset compose
+3. **Foot skating** : IK sur les pieds en contact sol
+4. **Lissage** : quaternions SLERP, jamais Euler (gimbal lock)
+5. **Verification multi-angle** : Claude inspecte depuis les 6 cameras
 
 ## Operateurs exposes
 
 | Idname | Action |
 |--------|--------|
-| `video_mocap.setup_cameras` | Cree ou met a jour les six cameras d'analyse autour du mesh |
-| `video_mocap.rig_mesh` | Prepare la requete MCP pour que Claude cree le rig du mesh |
-| `video_mocap.animate` | Prepare la requete MCP pour que Claude anime le rig depuis les videos/images |
-| `video_mocap.copy_request_to_txt` | Exporte la derniere requete en fichier `.txt` |
+| `video_mocap.extract` | Lance TRAM/HMR2/MediaPipe, produit .npz ou .json |
+| `video_mocap.rig_mesh` | Genere requete MCP pour le rigging |
+| `video_mocap.animate` | Genere requete MCP pour l'animation |
+| `video_mocap.run_all` | Enchaine extract + rig_mesh |
+| `video_mocap.setup_cameras` | Place les 6 cameras autour du mesh |
+| `video_mocap.copy_request_to_txt` | Exporte la requete en .txt |
 
-## Propriete importante
+## Proprietes (bpy.context.scene.vmmcp)
 
-Les proprietes sont disponibles dans `bpy.context.scene.vmmcp` :
-
-- `mesh_object`
-- `front_video`, `back_video`, `left_video`, `right_video`
-- `top_video`, `bottom_video`
+- `mesh_object`, `video_path`
+- `estimation_method`, `python_exe`, `smpl_method`
+- `front_video`, `back_video`, `left_video`, `right_video`, `top_video`, `bottom_video`
 - `image_sequence_dir`
-- `frame_start`, `frame_end`
 - `rig_preset`, `requested_bone_count`
-- `create_camera_setup`
-- `camera_distance`
-- `request_text_name`
-- `request_txt_path`
-
-## Limite MCP importante
-
-Un add-on Blender ne peut pas forcer Claude a executer une action tout seul.
-Dans l'architecture BlenderMCP, Claude est le client MCP et Blender expose des
-outils. Cet add-on prepare donc la requete et le contexte de scene; Claude doit
-ensuite utiliser BlenderMCP pour executer le rigging ou l'animation dans Blender.
+- `frame_start`, `frame_end`
+- `create_camera_setup`, `camera_distance`
+- `motion_data_path`, `request_text_name`, `request_txt_path`
 
 ## Fichiers
 
-- `__init__.py` - add-on Blender, panneau, boutons, setup cameras, generation
-  des requetes MCP.
-- `mediapipe_skeleton.py`, `retarget.py`, `extractor/extract_pose.py` -
-  anciens fichiers de prototype MediaPipe. Ils ne sont plus appeles par
-  l'add-on principal.
+- `__init__.py` — addon Blender, UI, operateurs, generation requetes MCP
+- `estimator/run_smpl.py` — script externe TRAM/HMR2, produit .npz
+- `_fallback/` — anciens fichiers MediaPipe (prototype, degrade)
+- `PROGRESS.md` — suivi de progression du projet
