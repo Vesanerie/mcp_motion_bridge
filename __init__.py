@@ -310,45 +310,47 @@ _pipe = {
 _pipe_lock = threading.Lock()
 
 
-def _claude_exe():
-    # Blender's PATH is restricted — check common locations explicitly
-    candidates = [
-        shutil.which("claude"),
-        os.path.expanduser("~/.nvm/versions/node/v24.14.1/bin/claude"),
-        "/usr/local/bin/claude",
-        "/opt/homebrew/bin/claude",
-    ]
-    # Also check all node versions in nvm
-    nvm_dir = os.path.expanduser("~/.nvm/versions/node")
-    if os.path.isdir(nvm_dir):
-        for v in sorted(os.listdir(nvm_dir), reverse=True):
-            candidates.append(os.path.join(nvm_dir, v, "bin", "claude"))
+def _send_to_claude_app(text):
+    """Send text to the Claude Code desktop app via AppleScript (macOS).
+    Copies to clipboard, activates Claude, pastes, and presses Enter.
+    """
+    import sys
+    if sys.platform != "darwin":
+        raise RuntimeError("Auto-send only works on macOS. Use Generate Prompt instead.")
 
-    for c in candidates:
-        if c and os.path.isfile(c) and os.access(c, os.X_OK):
-            return c
-    raise RuntimeError("'claude' not found — install Claude Code CLI.")
+    # Save to a temp file and use pbcopy for reliable clipboard handling
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
+    tmp.write(text)
+    tmp.close()
+
+    # Copy to clipboard via pbcopy (handles large text better than AppleScript)
+    subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+
+    # AppleScript: activate Claude, paste, press Enter
+    script = '''
+    tell application "Claude" to activate
+    delay 0.5
+    tell application "System Events"
+        keystroke "v" using command down
+        delay 0.3
+        keystroke return
+    end tell
+    '''
+    result = subprocess.run(["osascript", "-e", script],
+                           capture_output=True, text=True, timeout=10)
+    os.unlink(tmp.name)
+
+    if result.returncode != 0:
+        raise RuntimeError(f"AppleScript failed: {result.stderr.strip()}")
 
 
 def _run_one_step(marker, label, full_prompt):
-    """Blocking — runs in a daemon thread."""
+    """Blocking — sends the step prompt to Claude Code app via AppleScript."""
     with _pipe_lock:
-        _pipe["status"] = f"Running {label}…"
+        _pipe["status"] = f"Sending {label} to Claude Code…"
     try:
-        proc = subprocess.Popen(
-            [_claude_exe(), "-p"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        stdout, _ = proc.communicate(input=full_prompt.encode("utf-8"), timeout=900)
-        output = stdout.decode("utf-8", errors="replace")
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        with _pipe_lock:
-            _pipe["error"] = f"{label}: timed out after 15 min"
-            _pipe["running"] = False
-        return
+        _send_to_claude_app(full_prompt)
     except Exception as exc:
         with _pipe_lock:
             _pipe["error"] = f"{label}: {exc}"
@@ -356,19 +358,12 @@ def _run_one_step(marker, label, full_prompt):
         return
 
     with _pipe_lock:
-        _pipe["history"] += f"\n\n=== {label} OUTPUT ===\n{output.strip()}"
-        if f"{marker}:" in output:
-            _pipe["status"] = f"{label} — done"
-        else:
-            _pipe["error"] = (
-                f"{label} did not output '{marker}:'. "
-                f"Tail: …{output.strip()[-300:]}"
-            )
-            _pipe["running"] = False
+        _pipe["status"] = f"{label} — sent to Claude Code"
 
 
 def _pipeline_tick():
-    """bpy.app.timers callback — return float to keep firing, None to stop."""
+    """bpy.app.timers callback — sends one step, then stops.
+    User clicks 'Next Step' to send the next one (Claude needs time to execute)."""
     with _pipe_lock:
         if not _pipe["running"]:
             _sync_status_to_scene()
@@ -384,31 +379,21 @@ def _pipeline_tick():
             _sync_status_to_scene()
             return 1.0
 
-        # Thread finished (or first tick) — launch next step
+        # Thread finished — mark step as sent, pause for user
         idx = _pipe["step_idx"]
         steps = _pipe["steps"]
 
         if idx >= len(steps):
             _pipe["running"] = False
-            _pipe["status"] = f"Pipeline complete — {len(steps)} steps done!"
+            _pipe["status"] = f"All {len(steps)} steps sent to Claude Code!"
             _sync_status_to_scene(finished=True)
             return None
 
-        marker, label, step_text = steps[idx]
-        full_prompt = _pipe["history"] + "\n\n" + step_text
-        _pipe["step_idx"] = idx + 1
-        _pipe["status"] = f"[{idx + 1}/{len(steps)}] {label}…"
-
-        t = threading.Thread(
-            target=_run_one_step,
-            args=(marker, label, full_prompt),
-            daemon=True,
-        )
-        _pipe["thread"] = t
-        t.start()
+        # Step was just sent — pause pipeline, wait for user to click Next
+        _pipe["running"] = False
+        _pipe["status"] = f"Step {idx}/{len(steps)} sent — click 'Next Step' when Claude is done"
         _sync_status_to_scene()
-
-    return 1.0
+    return None
 
 
 def _sync_status_to_scene(finished=False):
@@ -1022,23 +1007,13 @@ class VMMCP_OT_generate_steps(Operator):
 
 
 class VMMCP_OT_run_pipeline(Operator):
-    """Run the full pipeline automatically, one step at a time via claude -p."""
+    """Send the first step to Claude Code app. Then use 'Next Step' for each following step."""
     bl_idname = "video_mocap.run_pipeline"
-    bl_label = "Run Pipeline"
+    bl_label = "Start Pipeline"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
         props = context.scene.vmmcp
-
-        if _pipe["running"]:
-            self.report({"WARNING"}, "Pipeline already running — stop it first.")
-            return {"CANCELLED"}
-
-        try:
-            _claude_exe()
-        except RuntimeError as exc:
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
 
         try:
             mesh, videos = _validate_scene(context, props)
@@ -1051,22 +1026,76 @@ class VMMCP_OT_run_pipeline(Operator):
         steps = _build_steps(videos, props)
 
         with _pipe_lock:
-            _pipe["running"] = True
             _pipe["step_idx"] = 0
             _pipe["steps"] = steps
             _pipe["history"] = ctx_text
-            _pipe["status"] = "Starting…"
+            _pipe["status"] = ""
             _pipe["error"] = ""
             _pipe["thread"] = None
             _pipe["scene_name"] = context.scene.name
 
-        props.pipeline_running = True
-        props.pipeline_status = f"Starting — {len(steps)} steps"
+        # Send first step immediately
+        return self._send_current_step(context, props)
 
-        if not bpy.app.timers.is_registered(_pipeline_tick):
-            bpy.app.timers.register(_pipeline_tick, first_interval=0.5)
+    def _send_current_step(self, context, props):
+        idx = _pipe["step_idx"]
+        steps = _pipe["steps"]
+        if idx >= len(steps):
+            props.pipeline_status = f"All {len(steps)} steps sent!"
+            return {"FINISHED"}
 
-        self.report({"INFO"}, f"Pipeline started — {len(steps)} steps")
+        marker, label, step_text = steps[idx]
+        full_prompt = _pipe["history"] + "\n\n" + step_text
+
+        try:
+            _send_to_claude_app(full_prompt)
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            props.pipeline_status = f"ERROR: {exc}"
+            return {"CANCELLED"}
+
+        _pipe["step_idx"] = idx + 1
+        props.pipeline_status = f"Step {idx + 1}/{len(steps)} sent: {label}"
+        props.pipeline_running = idx + 1 < len(steps)
+        self.report({"INFO"}, f"Sent to Claude Code: {label}")
+        return {"FINISHED"}
+
+
+class VMMCP_OT_next_step(Operator):
+    """Send the next step to Claude Code."""
+    bl_idname = "video_mocap.next_step"
+    bl_label = "Next Step"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        props = context.scene.vmmcp
+        idx = _pipe["step_idx"]
+        steps = _pipe["steps"]
+
+        if not steps:
+            self.report({"ERROR"}, "No pipeline started. Click 'Start Pipeline' first.")
+            return {"CANCELLED"}
+
+        if idx >= len(steps):
+            props.pipeline_status = f"All {len(steps)} steps already sent!"
+            props.pipeline_running = False
+            return {"FINISHED"}
+
+        marker, label, step_text = steps[idx]
+        full_prompt = _pipe["history"] + "\n\n" + step_text
+
+        try:
+            _send_to_claude_app(full_prompt)
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            props.pipeline_status = f"ERROR: {exc}"
+            return {"CANCELLED"}
+
+        _pipe["step_idx"] = idx + 1
+        remaining = len(steps) - _pipe["step_idx"]
+        props.pipeline_status = f"Step {idx + 1}/{len(steps)} sent: {label}"
+        props.pipeline_running = remaining > 0
+        self.report({"INFO"}, f"Sent: {label} ({remaining} remaining)")
         return {"FINISHED"}
 
 
@@ -1154,20 +1183,20 @@ class VMMCP_PT_panel(Panel):
 
         layout.separator()
 
-        # Auto pipeline
+        # Auto pipeline — sends to Claude Code app
         box = layout.box()
-        box.label(text="Auto Pipeline", icon="PLAY")
+        box.label(text="Send to Claude Code", icon="PLAY")
+        if props.pipeline_status:
+            err = "error" in props.pipeline_status.lower()
+            ok = "sent" in props.pipeline_status.lower() or "all" in props.pipeline_status.lower()
+            icon = "ERROR" if err else ("CHECKMARK" if ok else "INFO")
+            box.label(text=props.pipeline_status, icon=icon)
         if props.pipeline_running:
-            box.label(text=props.pipeline_status, icon="TIME")
-            box.operator("video_mocap.stop_pipeline", icon="CANCEL", text="Stop Pipeline")
+            box.operator("video_mocap.next_step", icon="FORWARD",
+                         text="Next Step →")
         else:
-            if props.pipeline_status:
-                err = "error" in props.pipeline_status.lower()
-                ok = "complete" in props.pipeline_status.lower()
-                icon = "ERROR" if err else ("CHECKMARK" if ok else "INFO")
-                box.label(text=props.pipeline_status, icon=icon)
             box.operator("video_mocap.run_pipeline", icon="PLAY",
-                         text="Run Pipeline (auto)")
+                         text="Start Pipeline")
 
         # Estimator info
         layout.separator()
@@ -1185,6 +1214,7 @@ classes = (
     VMMCP_OT_generate,
     VMMCP_OT_generate_steps,
     VMMCP_OT_run_pipeline,
+    VMMCP_OT_next_step,
     VMMCP_OT_stop_pipeline,
     VMMCP_PT_panel,
 )
