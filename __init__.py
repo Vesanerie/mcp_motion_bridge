@@ -525,10 +525,11 @@ def _build_steps(videos, props):
             f"=== {label} ===\n"
             "Execute ONLY this step. Do NOT start any other step.\n\n"
             + body +
-            f"\nWhen fully complete output EXACTLY this line as the very last line "
-            f"of your response (nothing after it):\n"
-            f"{marker}: {{\"summary\": \"<one sentence>\"}}\n"
-            "Do NOT output this line until the step is truly done.\n"
+            f"\nWhen this step is FULLY COMPLETE, you MUST execute this command "
+            f"via BlenderMCP as the very last action:\n"
+            f"  bpy.context.scene['vmmcp_step_done'] = '{marker}'\n"
+            f"This signals the addon that you are done. Do NOT run this command "
+            f"until the step is truly finished.\n"
         )
 
     steps = []
@@ -1084,16 +1085,11 @@ class VMMCP_OT_run_pipeline(Operator):
             _pipe["thread"] = None
             _pipe["scene_name"] = context.scene.name
 
-        # Send first step immediately
-        return self._send_current_step(context, props)
+        # Init marker and send first step
+        context.scene["vmmcp_step_done"] = ""
 
-    def _send_current_step(self, context, props):
         idx = _pipe["step_idx"]
         steps = _pipe["steps"]
-        if idx >= len(steps):
-            props.pipeline_status = f"All {len(steps)} steps sent!"
-            return {"FINISHED"}
-
         marker, label, step_text = steps[idx]
         full_prompt = _pipe["history"] + "\n\n" + step_text
 
@@ -1105,34 +1101,45 @@ class VMMCP_OT_run_pipeline(Operator):
             return {"CANCELLED"}
 
         _pipe["step_idx"] = idx + 1
-        props.pipeline_status = f"Step {idx + 1}/{len(steps)} sent: {label}"
-        props.pipeline_running = idx + 1 < len(steps)
+        props.pipeline_status = f"Step 1/{len(steps)} sent: {label} — waiting for Claude..."
+        props.pipeline_running = len(steps) > 1
         self.report({"INFO"}, f"Sent to Claude Code: {label}")
         return {"FINISHED"}
 
 
 class VMMCP_OT_next_step(Operator):
-    """Send the next step to Claude Code."""
+    """Send the next step to Claude Code (only if previous step is confirmed done)."""
     bl_idname = "video_mocap.next_step"
     bl_label = "Next Step"
     bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        """Only allow clicking if the previous step's marker is confirmed in the scene."""
+        steps = _pipe.get("steps", [])
+        idx = _pipe.get("step_idx", 0)
+        if not steps or idx <= 0 or idx > len(steps):
+            return False
+        # Check that the PREVIOUS step's marker exists in the scene
+        prev_marker = steps[idx - 1][0]
+        done_marker = context.scene.get("vmmcp_step_done", "")
+        return done_marker == prev_marker
 
     def execute(self, context):
         props = context.scene.vmmcp
         idx = _pipe["step_idx"]
         steps = _pipe["steps"]
 
-        if not steps:
-            self.report({"ERROR"}, "No pipeline started. Click 'Start Pipeline' first.")
-            return {"CANCELLED"}
-
         if idx >= len(steps):
-            props.pipeline_status = f"All {len(steps)} steps already sent!"
+            props.pipeline_status = f"All {len(steps)} steps done!"
             props.pipeline_running = False
             return {"FINISHED"}
 
         marker, label, step_text = steps[idx]
         full_prompt = _pipe["history"] + "\n\n" + step_text
+
+        # Clear the marker before sending the new step
+        context.scene["vmmcp_step_done"] = ""
 
         try:
             _send_to_claude_app(full_prompt)
@@ -1143,7 +1150,7 @@ class VMMCP_OT_next_step(Operator):
 
         _pipe["step_idx"] = idx + 1
         remaining = len(steps) - _pipe["step_idx"]
-        props.pipeline_status = f"Step {idx + 1}/{len(steps)} sent: {label}"
+        props.pipeline_status = f"Step {idx + 1}/{len(steps)} sent: {label} — waiting for Claude..."
         props.pipeline_running = remaining > 0
         self.report({"INFO"}, f"Sent: {label} ({remaining} remaining)")
         return {"FINISHED"}
@@ -1238,13 +1245,28 @@ class VMMCP_PT_panel(Panel):
         box.label(text="Send to Claude Code", icon="PLAY")
         if props.pipeline_status:
             err = "error" in props.pipeline_status.lower()
-            ok = "sent" in props.pipeline_status.lower() or "all" in props.pipeline_status.lower()
-            icon = "ERROR" if err else ("CHECKMARK" if ok else "INFO")
+            done = "all" in props.pipeline_status.lower() and "done" in props.pipeline_status.lower()
+            icon = "ERROR" if err else ("CHECKMARK" if done else "INFO")
             box.label(text=props.pipeline_status, icon=icon)
-        if props.pipeline_running:
-            box.operator("video_mocap.next_step", icon="FORWARD",
-                         text="Next Step →")
-        else:
+
+        steps = _pipe.get("steps", [])
+        idx = _pipe.get("step_idx", 0)
+
+        if steps and idx > 0 and idx <= len(steps):
+            # Show what we're waiting for
+            prev_marker = steps[idx - 1][0]
+            scene_marker = context.scene.get("vmmcp_step_done", "")
+            if scene_marker == prev_marker:
+                box.label(text="Claude finished — ready for next step", icon="CHECKMARK")
+            else:
+                box.label(text="Waiting for Claude to finish...", icon="TIME")
+
+        if props.pipeline_running and idx < len(steps):
+            row = box.row()
+            row.enabled = VMMCP_OT_next_step.poll(context)
+            row.operator("video_mocap.next_step", icon="FORWARD",
+                         text=f"Next Step ({idx + 1}/{len(steps)}) →")
+        elif not steps or idx >= len(steps):
             box.operator("video_mocap.run_pipeline", icon="PLAY",
                          text="Start Pipeline")
 
