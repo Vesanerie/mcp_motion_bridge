@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Video Mocap MCP",
     "author": "You",
-    "version": (0, 6, 0),
+    "version": (0, 7, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Mocap",
     "description": "Prepare motion capture context for Claude Code via BlenderMCP.",
@@ -192,19 +192,20 @@ def _build_prompt(context, mesh, cameras, videos, props):
         "FULL PIPELINE TO EXECUTE:\n\n"
 
         "STEP 1 — MOTION EXTRACTION:\n"
-        "Run 4D-Humans (HMR2.0) on the reference videos to extract SMPL params.\n"
-        "This is the recommended estimator for macOS Apple Silicon (MPS backend).\n"
-        "The estimator script is at: estimator/run_4dhumans.py in the addon folder.\n"
-        "Run it in a separate Python env (~/hmr2_env) via subprocess:\n"
-        "  PYTORCH_ENABLE_MPS_FALLBACK=1 ~/hmr2_env/bin/python run_4dhumans.py \\\n"
-        "    --video <path> --out <path>.npz\n"
-        "Output: per-frame SMPL parameters (72 axis-angle rotations for 24 joints,\n"
-        "10 shape params, root translation) saved as .npz.\n"
+        "Run the MediaPipe + IK estimator on the reference videos.\n"
+        "The estimator script is at: estimator/run_mediapipe_ik.py in the addon folder.\n"
+        "It requires a Python env with mediapipe, opencv-python, numpy, scipy.\n"
+        "Setup if not done:\n"
+        "  python3.11 -m venv ~/mp_env && source ~/mp_env/bin/activate\n"
+        "  pip install mediapipe opencv-python numpy scipy\n"
+        "Run via subprocess:\n"
+        "  ~/mp_env/bin/python estimator/run_mediapipe_ik.py \\\n"
+        "    --video <path> --out <path>.npz --complexity 2\n"
+        "Output: per-frame axis-angle rotations for 24 joints (same format as SMPL),\n"
+        "root translation, and 3D joint positions, saved as .npz.\n"
         "If multiple videos are provided, use the one with best visibility for\n"
         "extraction, and use the others for cross-view verification later.\n"
-        "NOTE: HMR2 outputs camera-relative poses (no global trajectory).\n"
-        "The character will animate in place. For global movement, reconstruct\n"
-        "from 2D hip positions in the video.\n\n"
+        "The rotations are pre-smoothed via quaternion averaging.\n\n"
 
         "STEP 2 — RIGGING:\n"
         "Inspect the mesh from the 6 analysis cameras (already placed in the scene).\n"
@@ -342,9 +343,9 @@ class VMMCP_PT_panel(Panel):
         # Estimator info
         layout.separator()
         info = layout.box()
-        info.label(text="Estimator: 4D-Humans (local, macOS compatible)", icon="ARMATURE_DATA")
-        info.label(text="For cinematic camera: TRAM cloud (coming soon)")
-        info.label(text="Legacy MediaPipe fallback for quick tests")
+        info.label(text="Estimator: MediaPipe + IK (macOS compatible)", icon="ARMATURE_DATA")
+        info.label(text="Outputs SMPL-format rotations (.npz)")
+        info.label(text="Needs: ~/mp_env with mediapipe + scipy")
 
 
 # ------------------------------------------------------------------
