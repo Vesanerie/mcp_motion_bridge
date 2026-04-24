@@ -27,9 +27,9 @@ Claude Code via BlenderMCP
 
 | Decision | Choix | Raison |
 |----------|-------|--------|
-| Estimateur principal | MediaPipe + IK analytique | Fonctionne sur macOS Apple Silicon, pas de CUDA |
+| Estimateur principal | 4D-Humans (HMR2) | SMPL rotations directes, chumpy contourne |
 | Estimateur premium (futur) | TRAM cloud | CUDA requis, prevu en remote GPU |
-| Estimateur abandonne | 4D-Humans (HMR2) | chumpy incompatible Python 3.11 |
+| Estimateur fallback | MediaPipe + IK | Plus leger, moins precis |
 | Format sortie | .npz | Portable, lisible numpy, meme format SMPL |
 | Paradigme mouvement | Rotations axis-angle 24 joints | Compatible rig Blender directement |
 | 6 cameras | Analyse mesh + verif animation | PAS de stereo sur la video source |
@@ -63,14 +63,20 @@ Claude Code via BlenderMCP
 - [x] Prompt mis a jour : 4D-Humans local, TRAM cloud coming soon
 - [x] UI : infos estimateur dans le panel
 
-### 2026-04-24 - Iteration 4 : MediaPipe + IK (solution qui marche)
+### 2026-04-24 - Iteration 4 : MediaPipe + IK (temporaire)
 - [x] HMR2 echoue a l'install (chumpy incompatible Python 3.11)
 - [x] estimator/run_mediapipe_ik.py : MediaPipe landmarks → rotations via IK
 - [x] Lissage quaternion integre (window=5)
 - [x] Sort .npz meme format que SMPL (24 joints, axis-angle)
-- [x] scipy installe dans ~/mp_env
-- [x] Prompt et UI mis a jour
-- [x] UI simplifiee : un seul bouton Generate Prompt
+- [x] Remplace par 4D-Humans dans l'iteration 5
+
+### 2026-04-24 - Iteration 5 : 4D-Humans fonctionne sur macOS
+- [x] chumpy contourne : stub minimal + pkl SMPL nettoye des objets chumpy
+- [x] PyTorch weights_only patche (checkpoint HMR2 officiel trusted)
+- [x] Renderer OpenGL/pyrender rendu optionnel (pas besoin pour inference)
+- [x] Modele HMR2 charge et fonctionne sur Apple Silicon (MPS)
+- [x] run_4dhumans.py reecrit avec l'API reelle (load_hmr2 + forward_step)
+- [x] Prompt et UI mis a jour pour 4D-Humans
 
 ## Contrainte plateforme
 

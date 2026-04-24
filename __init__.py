@@ -192,20 +192,17 @@ def _build_prompt(context, mesh, cameras, videos, props):
         "FULL PIPELINE TO EXECUTE:\n\n"
 
         "STEP 1 — MOTION EXTRACTION:\n"
-        "Run the MediaPipe + IK estimator on the reference videos.\n"
-        "The estimator script is at: estimator/run_mediapipe_ik.py in the addon folder.\n"
-        "It requires a Python env with mediapipe, opencv-python, numpy, scipy.\n"
-        "Setup if not done:\n"
-        "  python3.11 -m venv ~/mp_env && source ~/mp_env/bin/activate\n"
-        "  pip install mediapipe opencv-python numpy scipy\n"
+        "Run 4D-Humans (HMR2.0) on the reference videos to extract SMPL params.\n"
+        "The estimator script is at: estimator/run_4dhumans.py in the addon folder.\n"
+        "The Python env is ~/hmr2_env (already set up with all patches).\n"
         "Run via subprocess:\n"
-        "  ~/mp_env/bin/python estimator/run_mediapipe_ik.py \\\n"
-        "    --video <path> --out <path>.npz --complexity 2\n"
-        "Output: per-frame axis-angle rotations for 24 joints (same format as SMPL),\n"
-        "root translation, and 3D joint positions, saved as .npz.\n"
+        "  PYTORCH_ENABLE_MPS_FALLBACK=1 ~/hmr2_env/bin/python \\\n"
+        "    estimator/run_4dhumans.py --video <path> --out <path>.npz\n"
+        "Output: per-frame SMPL parameters (72 axis-angle rotations for 24 joints,\n"
+        "10 shape params, root translation) saved as .npz.\n"
         "If multiple videos are provided, use the one with best visibility for\n"
         "extraction, and use the others for cross-view verification later.\n"
-        "The rotations are pre-smoothed via quaternion averaging.\n\n"
+        "NOTE: HMR2 outputs camera-relative poses. The character animates in place.\n\n"
 
         "STEP 2 — RIGGING:\n"
         "Inspect the mesh from the 6 analysis cameras (already placed in the scene).\n"
@@ -343,9 +340,9 @@ class VMMCP_PT_panel(Panel):
         # Estimator info
         layout.separator()
         info = layout.box()
-        info.label(text="Estimator: MediaPipe + IK (macOS compatible)", icon="ARMATURE_DATA")
-        info.label(text="Outputs SMPL-format rotations (.npz)")
-        info.label(text="Needs: ~/mp_env with mediapipe + scipy")
+        info.label(text="Estimator: 4D-Humans / HMR2 (SMPL)", icon="ARMATURE_DATA")
+        info.label(text="Env: ~/hmr2_env (macOS Apple Silicon OK)")
+        info.label(text="Output: .npz with 24-joint rotations")
 
 
 # ------------------------------------------------------------------
