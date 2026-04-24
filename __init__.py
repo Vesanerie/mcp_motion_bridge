@@ -95,10 +95,6 @@ class VMMCP_Props(PropertyGroup):
     right_video: StringProperty(name="Right", subtype="FILE_PATH", default="")
     top_video: StringProperty(name="Top", subtype="FILE_PATH", default="")
     bottom_video: StringProperty(name="Bottom", subtype="FILE_PATH", default="")
-    camera_distance: FloatProperty(
-        name="Camera Distance",
-        default=2.4, min=0.5, max=20.0,
-    )
     frame_start: IntProperty(name="Start", default=1, min=1)
     frame_end: IntProperty(name="End", default=250, min=1)
     user_camera: StringProperty(
@@ -151,9 +147,10 @@ def _look_at(obj, target):
 
 def _setup_cameras(context, mesh, props):
     center, _min_v, _max_v, size, radius = _world_bbox(mesh)
-    distance = radius * props.camera_distance
-    # Use the full 3D diagonal so the mesh is always fully visible regardless of view axis
-    ortho_scale = size.length * 1.15
+    # Fixed 1m base distance — Claude adjusts later if needed
+    distance = 1.0
+    # Ortho scale: large enough to see the full mesh with generous margin
+    ortho_scale = max(size.length * 2.0, 3.0)
 
     if props.cleanup_cameras:
         vmmcp_names = {f"VMMCP_{v.upper()}_Camera" for v, _ in CAMERA_SPECS}
@@ -184,7 +181,15 @@ def _setup_cameras(context, mesh, props):
         cam_obj.data.clip_end = max(distance * 10.0, 1000.0)
         cam_obj.data.show_passepartout = True
         cam_obj.data.passepartout_alpha = 1.0
+        # Square sensor for uniform framing on all axes
+        cam_obj.data.sensor_fit = "AUTO"
+        cam_obj.data.sensor_width = 36.0
+        cam_obj.data.sensor_height = 36.0
         cameras[view_name] = cam_obj.name
+
+    # Set render resolution to square so camera view matches
+    context.scene.render.resolution_x = 1024
+    context.scene.render.resolution_y = 1024
     return cameras
 
 
@@ -560,13 +565,19 @@ def _build_steps(videos, props):
     steps = []
 
     steps.append(wrap("STEP_0_OK", "Step 0 — Camera Framing",
-        "Verify every VMMCP camera:\n"
-        "  a) Switch to each VMMCP camera in turn\n"
-        "  b) Confirm the complete mesh is fully inside the frame (tip to toe)\n"
-        "  c) If not: reposition so bbox center aligns with line of sight;\n"
-        "     increase ortho_scale until mesh fits with 15% margin\n"
-        "  d) Do NOT change camera.data.type away from 'ORTHO'\n"
-        "  e) Do NOT skip any camera\n"
+        "The 6 VMMCP cameras are placed at 1m from center as a starting point.\n"
+        "Your job is to adjust them so the ENTIRE mesh is visible from each angle.\n\n"
+        "For EACH VMMCP camera:\n"
+        "  a) Switch to the camera view\n"
+        "  b) Move the camera BACK along its axis until the full mesh is visible\n"
+        "     with at least 20% margin on all sides\n"
+        "  c) Increase ortho_scale to fit: use mesh bbox diagonal * 2.0 as minimum\n"
+        "  d) Center the camera on the mesh bbox center\n"
+        "  e) Confirm: head, feet, arms, and all extremities are inside the frame\n"
+        "  f) Do NOT change camera.data.type away from 'ORTHO'\n"
+        "  g) Do NOT skip any camera — all 6 must be verified\n\n"
+        "The cameras must show the mesh FULLY DEZOOMED — it's better to have too\n"
+        "much margin than to clip any part of the mesh.\n"
     ))
 
     if single_file_mode:
@@ -1304,7 +1315,6 @@ class VMMCP_PT_panel(Panel):
         # Settings
         box = layout.box()
         box.label(text="Settings", icon="PREFERENCES")
-        box.prop(props, "camera_distance")
         row = box.row(align=True)
         row.prop(props, "frame_start")
         row.prop(props, "frame_end")
