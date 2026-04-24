@@ -151,25 +151,56 @@ def _look_at(obj, target):
     obj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
 
 
+def _existing_camera_map():
+    cameras = [obj for obj in bpy.data.objects if obj.type == "CAMERA"]
+    if not cameras:
+        return {}
+
+    unused = sorted(cameras, key=lambda obj: obj.name.lower())
+    mapped = {}
+    for view_name, _axis in CAMERA_SPECS:
+        named = next((cam for cam in unused if view_name in cam.name.lower()), None)
+        if named is not None:
+            mapped[view_name] = named
+            unused.remove(named)
+
+    for view_name, _axis in CAMERA_SPECS:
+        if view_name in mapped or not unused:
+            continue
+        mapped[view_name] = unused.pop(0)
+
+    return mapped
+
+
 def _setup_cameras(context, mesh, props):
     center, _min_v, _max_v, _size, radius = _world_bbox(mesh)
     distance = radius * props.camera_distance
     cameras = {}
+    existing = _existing_camera_map()
 
     for view_name, axis in CAMERA_SPECS:
-        cam_name = f"VMMCP_{view_name.upper()}_Camera"
-        cam_obj = bpy.data.objects.get(cam_name)
-        if cam_obj is None:
-            cam_data = bpy.data.cameras.new(cam_name)
-            cam_obj = bpy.data.objects.new(cam_name, cam_data)
-            context.collection.objects.link(cam_obj)
-        elif cam_obj.type != "CAMERA":
+        cam_obj = existing.get(view_name)
+        if cam_obj is None and not existing:
+            cam_name = f"VMMCP_{view_name.upper()}_Camera"
+            cam_obj = bpy.data.objects.get(cam_name)
+            if cam_obj is not None and cam_obj.type != "CAMERA":
+                continue
+            if cam_obj is None:
+                cam_data = bpy.data.cameras.new(cam_name)
+                cam_obj = bpy.data.objects.new(cam_name, cam_data)
+                context.collection.objects.link(cam_obj)
+        elif cam_obj is None:
+            continue
+
+        if cam_obj.type != "CAMERA":
             continue
 
         cam_obj.location = center + axis.normalized() * distance
         _look_at(cam_obj, center)
-        cam_obj.data.lens = 70
+        cam_obj.data.lens = 50
         cam_obj.data.clip_end = max(distance * 10.0, 1000.0)
+        cam_obj.data.type = "ORTHO"
+        cam_obj.data.ortho_scale = max(radius * 2.4, 0.1)
         cameras[view_name] = cam_obj.name
 
     return cameras
@@ -278,6 +309,11 @@ def _base_payload(context, mesh, props, cameras):
         "scene": context.scene.name,
         "mesh": _mesh_summary(mesh),
         "camera_setup": cameras,
+        "camera_policy": {
+            "reuse_existing_cameras": True,
+            "create_cameras_only_when_scene_has_none": True,
+            "framing_requirement": "Each listed camera must be adjusted to see the entire mesh, including all animated limbs, across the full frame range.",
+        },
         "media_sources": _media_sources(props),
         "rig_settings": _rig_settings(props),
         "frame_range": {
@@ -291,8 +327,8 @@ def _base_payload(context, mesh, props, cameras):
 def _request_text(kind, payload):
     if kind == "rig":
         task = (
-            "Use BlenderMCP to inspect the mesh and the six scene cameras "
-            "(top, bottom, front, back, left, right). Create an armature that "
+            "Use BlenderMCP to inspect the mesh and the listed scene cameras "
+            "(top, bottom, front, back, left, right when available). Create an armature that "
             "matches the mesh anatomy/topology, place bones inside the mesh, "
             "honor the requested rig target and approximate bone count, "
             "parent/deform the mesh to that armature, create usable IK/FK "
@@ -327,6 +363,14 @@ def _request_text(kind, payload):
         "- Follow the rig_settings payload for target platform and bone count.\n"
         "- Use the existing Blender scene as source of truth.\n"
         "- Use the camera objects listed in the payload as analysis views.\n\n"
+        "Camera setup requirement:\n"
+        "- Do not add extra cameras if camera_setup already lists scene cameras.\n"
+        "- Reuse and adjust the listed cameras instead.\n"
+        "- Move/rotate/set focal length or orthographic scale so every listed camera "
+        "sees the entire target mesh, including limbs and root motion, for the full "
+        "animation frame range.\n"
+        "- If a camera cannot see the full mesh, fix the camera framing before using "
+        "that angle for rigging or motion verification.\n\n"
         "Reference filtering:\n"
         "- Analyze motion only from the supplied videos or image sequence.\n"
         "- Ignore any object, character, prop, background element, lighting cue or "

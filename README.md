@@ -33,9 +33,12 @@ Claude inspecte la scene Blender, cree le rig, puis anime les memes bones
 Le bouton `Rig Mesh` :
 
 - prend le mesh choisi dans le panneau `Mocap`;
-- cree ou met a jour les cameras `VMMCP_FRONT_Camera`,
-  `VMMCP_BACK_Camera`, `VMMCP_LEFT_Camera`, `VMMCP_RIGHT_Camera`,
-  `VMMCP_TOP_Camera`, `VMMCP_BOTTOM_Camera`;
+- reutilise les cameras deja presentes dans la scene et ne rajoute aucune
+  camera si au moins une camera existe deja;
+- cree les cameras `VMMCP_FRONT_Camera`, `VMMCP_BACK_Camera`,
+  `VMMCP_LEFT_Camera`, `VMMCP_RIGHT_Camera`, `VMMCP_TOP_Camera`,
+  `VMMCP_BOTTOM_Camera` uniquement si la scene ne contient aucune camera;
+- place ou ajuste les cameras pour cadrer le mesh entier;
 - collecte les infos utiles du mesh : vertex count, polygons, bounding box,
   transforms, modifiers, materials, shape keys;
 - transmet a Claude le type de rig cible et le nombre de bones demande;
@@ -48,6 +51,21 @@ Le bouton `Rig Mesh` :
 Cette requete demande a Claude, via BlenderMCP, d'inspecter le mesh et les six
 vues camera, puis de creer une armature adaptee au mesh. Le mesh doit etre lie
 aux bones crees, avec des controles utilisables quand c'est pertinent.
+
+## Cameras
+
+L'add-on ne cree pas de nouvelles cameras si la scene contient deja des cameras.
+Il les reutilise dans l'ordre suivant :
+
+- une camera dont le nom contient `front`, `back`, `left`, `right`, `top` ou
+  `bottom` est associee a cette vue;
+- les autres cameras existantes sont assignees aux vues restantes dans l'ordre
+  alphabetique;
+- s'il n'existe aucune camera, l'add-on cree les six cameras `VMMCP_*`.
+
+Quand une requete est envoyee a Claude, elle lui demande explicitement de
+repositionner, orienter et regler la focale ou l'orthographic scale des cameras
+listees afin que le mesh soit visible en entier pendant toute l'animation.
 
 ## Nombre de bones
 
