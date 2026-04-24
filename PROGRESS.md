@@ -48,7 +48,16 @@ Claude via BlenderMCP
 - [x] __init__.py refonte pipeline SMPL (merge avec features v0.2.2)
 - [x] Fallback MediaPipe dans l'UI (avec warning degrade)
 - [x] README mis a jour (arbre de decision, architecture, pieges)
-- [ ] Zip addon + test Blender
+- [x] Zip addon + test Blender
+
+### 2026-04-24 - Iteration 3 : macOS Apple Silicon
+- [x] Contrainte plateforme : pas de CUDA, MPS only
+- [x] estimator/run_4dhumans.py (HMR2, MPS compatible)
+- [x] estimator/smpl_output.py (format .npz canonique)
+- [x] estimator/README.md (setup env macOS + Linux)
+- [x] Prompt mis a jour : 4D-Humans local, TRAM cloud coming soon
+- [x] UI : infos estimateur dans le panel
+- [x] Ancien run_smpl.py conserve (TRAM si CUDA dispo)
 
 ## Pieges documentes
 

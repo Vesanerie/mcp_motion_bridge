@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Video Mocap MCP",
     "author": "You",
-    "version": (0, 5, 0),
+    "version": (0, 6, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Mocap",
     "description": "Prepare motion capture context for Claude Code via BlenderMCP.",
@@ -192,15 +192,19 @@ def _build_prompt(context, mesh, cameras, videos, props):
         "FULL PIPELINE TO EXECUTE:\n\n"
 
         "STEP 1 — MOTION EXTRACTION:\n"
-        "Install and run a SMPL-based motion estimator on the reference videos.\n"
-        "Preferred: TRAM (ECCV 2024) for best quality on in-the-wild videos.\n"
-        "Fallback: 4D-Humans (HMR2.0) if TRAM is unavailable.\n"
-        "Last resort: MediaPipe Pose (degraded, 33 landmarks, noisy depth).\n"
-        "Run the estimator in a subprocess using a Python with PyTorch installed.\n"
+        "Run 4D-Humans (HMR2.0) on the reference videos to extract SMPL params.\n"
+        "This is the recommended estimator for macOS Apple Silicon (MPS backend).\n"
+        "The estimator script is at: estimator/run_4dhumans.py in the addon folder.\n"
+        "Run it in a separate Python env (~/hmr2_env) via subprocess:\n"
+        "  PYTORCH_ENABLE_MPS_FALLBACK=1 ~/hmr2_env/bin/python run_4dhumans.py \\\n"
+        "    --video <path> --out <path>.npz\n"
         "Output: per-frame SMPL parameters (72 axis-angle rotations for 24 joints,\n"
         "10 shape params, root translation) saved as .npz.\n"
         "If multiple videos are provided, use the one with best visibility for\n"
-        "extraction, and use the others for cross-view verification later.\n\n"
+        "extraction, and use the others for cross-view verification later.\n"
+        "NOTE: HMR2 outputs camera-relative poses (no global trajectory).\n"
+        "The character will animate in place. For global movement, reconstruct\n"
+        "from 2D hip positions in the video.\n\n"
 
         "STEP 2 — RIGGING:\n"
         "Inspect the mesh from the 6 analysis cameras (already placed in the scene).\n"
@@ -334,6 +338,13 @@ class VMMCP_PT_panel(Panel):
         # The one button
         layout.operator("video_mocap.generate", icon="COPYDOWN", text="Generate Prompt")
         layout.label(text="Then paste in Claude Code + BlenderMCP", icon="INFO")
+
+        # Estimator info
+        layout.separator()
+        info = layout.box()
+        info.label(text="Estimator: 4D-Humans (local, macOS compatible)", icon="ARMATURE_DATA")
+        info.label(text="For cinematic camera: TRAM cloud (coming soon)")
+        info.label(text="Legacy MediaPipe fallback for quick tests")
 
 
 # ------------------------------------------------------------------
