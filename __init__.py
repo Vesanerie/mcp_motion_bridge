@@ -288,9 +288,48 @@ def _debug_log(msg):
 def _clear_steps_dir():
     d = _steps_dir()
     for f in os.listdir(d):
+        # Keep .mcp.json and .claude/ and CLAUDE.md
+        if f in (".mcp.json", ".claude", "CLAUDE.md"):
+            continue
         fp = os.path.join(d, f)
         if os.path.isfile(fp):
             os.unlink(fp)
+
+
+def _write_claude_md(steps_dir):
+    """Write CLAUDE.md that tells Claude to auto-chain steps."""
+    path = os.path.join(steps_dir, "CLAUDE.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(
+            "# VMMCP Pipeline Instructions\n\n"
+            "You are running a step-by-step motion capture pipeline.\n\n"
+            "AFTER completing each step:\n"
+            "1. Create the signal file as instructed at the end of the step\n"
+            "2. Wait 5 seconds\n"
+            "3. Check if a file called NEXT_STEP.md exists in this directory\n"
+            "4. If it exists, read it and execute the step it points to\n"
+            "5. If it does not exist yet, wait 5 more seconds and check again\n"
+            "6. Repeat until NEXT_STEP.md appears or says PIPELINE_DONE\n\n"
+            "IMPORTANT: After EACH step, you MUST check for NEXT_STEP.md.\n"
+            "Do NOT stop after one step. The pipeline has multiple steps.\n"
+        )
+    return path
+
+
+def _write_next_step(steps_dir, step_path):
+    """Write NEXT_STEP.md pointing to the next step file."""
+    path = os.path.join(steps_dir, "NEXT_STEP.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"Read and execute the prompt in {step_path}\n")
+    return path
+
+
+def _write_pipeline_done(steps_dir):
+    """Write NEXT_STEP.md with completion signal."""
+    path = os.path.join(steps_dir, "NEXT_STEP.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("PIPELINE_DONE\n\nAll steps have been completed. Good job!\n")
+    return path
 
 
 def _write_step_file(step_idx, marker, label, full_prompt):
@@ -363,45 +402,6 @@ def _launch_claude_terminal(work_dir, first_msg):
         ])
 
 
-def _send_msg_to_terminal(msg):
-    """Send a message to the Claude terminal via clipboard paste. Non-blocking."""
-    import sys
-    _debug_log(f"SEND: platform={sys.platform}, msg_len={len(msg)}")
-    if sys.platform == "darwin":
-        proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-        proc.communicate(msg.encode("utf-8"))
-        _debug_log(f"SEND: pbcopy done, returncode={proc.returncode}")
-        script = (
-            'tell application "Terminal"\n'
-            '    activate\n'
-            '    delay 0.8\n'
-            '    tell application "System Events"\n'
-            '        tell process "Terminal"\n'
-            '            set frontmost to true\n'
-            '            delay 0.3\n'
-            '            keystroke "v" using command down\n'
-            '            delay 0.5\n'
-            '            keystroke return\n'
-            '        end tell\n'
-            '    end tell\n'
-            'end tell'
-        )
-        proc = subprocess.Popen(["osascript", "-e", script])
-        _debug_log(f"SEND: osascript launched, pid={proc.pid}")
-    elif sys.platform == "win32":
-        ps = (
-            'Add-Type -AssemblyName System.Windows.Forms\n'
-            f'[System.Windows.Forms.Clipboard]::SetText("{msg}")\n'
-            'Start-Sleep -Milliseconds 300\n'
-            '$wshell = New-Object -ComObject wscript.shell\n'
-            '$wshell.AppActivate("Terminal")\n'
-            'Start-Sleep -Milliseconds 500\n'
-            '[System.Windows.Forms.SendKeys]::SendWait("^v")\n'
-            'Start-Sleep -Milliseconds 300\n'
-            '[System.Windows.Forms.SendKeys]::SendWait("{ENTER}")\n'
-        )
-        subprocess.Popen(["powershell", "-NoProfile", "-Command", ps])
-
 
 def _pipeline_tick():
     """Blender timer — polls marker every 3 seconds, auto-advances steps."""
@@ -452,27 +452,28 @@ def _pipeline_tick():
     # Are there more steps?
     if idx >= len(steps):
         _debug_log("TICK: no more steps, completing")
+        _write_pipeline_done(_steps_dir())
         _pipe["step_idx"] = idx + 1
         _pipe["running"] = False
         props.pipeline_status = f"Pipeline complete — {len(steps)} steps done!"
         return None
 
-    # --- SEND NEXT STEP ---
+    # --- WRITE NEXT STEP FILE ---
     marker, label, step_text = steps[idx]
     full_prompt = _pipe["context_text"] + "\n\n" + step_text
 
     step_path = _write_step_file(idx, marker, label, full_prompt)
     _debug_log(f"TICK: wrote step file {step_path}")
 
-    msg = f"Read and execute the prompt in {step_path}"
-    _debug_log(f"TICK: sending to terminal: {msg}")
-    _send_msg_to_terminal(msg)
+    # Write NEXT_STEP.md so Claude picks it up
+    _write_next_step(_steps_dir(), step_path)
+    _debug_log(f"TICK: wrote NEXT_STEP.md -> {step_path}")
 
     _pipe["step_idx"] = idx + 1
     _pipe["last_sent_marker"] = marker
     _pipe["last_activity"] = time.time()
     props.pipeline_status = f"Step {idx + 1}/{len(steps)}: {label} — running..."
-    _debug_log(f"TICK: step {idx + 1} '{label}' sent, waiting for '{marker}'")
+    _debug_log(f"TICK: step {idx + 1} '{label}' ready, waiting for '{marker}'")
 
     return 3.0
 
@@ -539,15 +540,20 @@ def _build_steps(videos, props):
 
     def wrap(marker, label, body):
         done_file = os.path.join(steps_dir, f"{marker}.done")
+        next_step_file = os.path.join(steps_dir, "NEXT_STEP.md")
         return (marker, label,
             f"=== {label} ===\n"
-            "Execute ONLY this step. Do NOT start any other step.\n\n"
+            "Execute ONLY this step.\n\n"
             + body +
-            f"\nWhen this step is FULLY COMPLETE, create this signal file "
-            f"as the very last action:\n"
-            f"  Write the word 'done' to: {done_file}\n"
-            f"  (e.g. run: echo done > '{done_file}')\n"
-            f"Do NOT create this file until the step is truly finished.\n"
+            f"\nWhen this step is FULLY COMPLETE, do these 3 things IN ORDER:\n"
+            f"  1. Create the signal file: write 'done' to {done_file}\n"
+            f"  2. Wait 5 seconds (the addon needs time to write the next step)\n"
+            f"  3. Read the file {next_step_file} — it contains the path to "
+            f"the next step. Execute that step.\n"
+            f"     If it says PIPELINE_DONE, stop.\n"
+            f"     If the file does not exist yet, wait 5 more seconds and retry.\n"
+            f"\nDo NOT create the signal file until the step is truly finished.\n"
+            f"Do NOT stop after this step — always check NEXT_STEP.md.\n"
         )
 
     steps = []
@@ -737,9 +743,10 @@ class VMMCP_OT_launch(Operator):
         ctx_text = _build_context(context, mesh, cameras, videos, props)
         steps = _build_steps(videos, props)
 
-        # Clear old files
+        # Clear old files and write CLAUDE.md
         _clear_steps_dir()
         steps_dir = _steps_dir()
+        _write_claude_md(steps_dir)
 
         # Write first step
         marker, label, step_text = steps[0]
