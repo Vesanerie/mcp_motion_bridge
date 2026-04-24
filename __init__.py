@@ -351,6 +351,82 @@ def _clear_steps_dir():
             os.unlink(os.path.join(d, f))
 
 
+def _ensure_mcp_config(steps_dir):
+    """Write .mcp.json in the steps dir so Claude Code CLI has BlenderMCP access."""
+    mcp_path = os.path.join(steps_dir, ".mcp.json")
+    config = {
+        "mcpServers": {
+            "blender": {
+                "command": "uvx",
+                "args": ["blender-mcp"]
+            }
+        }
+    }
+    with open(mcp_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+    return mcp_path
+
+
+def _launch_claude_terminal(steps_dir, first_step_path):
+    """Open a new terminal window with Claude Code session in the steps dir.
+    Works on macOS and Windows.
+    """
+    import sys
+
+    # Write .mcp.json so claude has BlenderMCP
+    _ensure_mcp_config(steps_dir)
+
+    # Find claude CLI
+    claude_path = None
+    candidates = [
+        shutil.which("claude"),
+        os.path.expanduser("~/.nvm/versions/node/v24.14.1/bin/claude"),
+        "/usr/local/bin/claude",
+        "/opt/homebrew/bin/claude",
+    ]
+    nvm_dir = os.path.expanduser("~/.nvm/versions/node")
+    if os.path.isdir(nvm_dir):
+        for v in sorted(os.listdir(nvm_dir), reverse=True):
+            candidates.append(os.path.join(nvm_dir, v, "bin", "claude"))
+    if sys.platform == "win32":
+        candidates.extend([
+            os.path.expandvars(r"%APPDATA%\npm\claude.cmd"),
+            os.path.expandvars(r"%PROGRAMFILES%\nodejs\claude.cmd"),
+        ])
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            claude_path = c
+            break
+
+    if not claude_path:
+        raise RuntimeError("'claude' CLI not found. Install Claude Code CLI first.")
+
+    # First message: tell Claude to read and execute the first step
+    first_msg = f"Read and execute the prompt in {first_step_path}"
+
+    if sys.platform == "darwin":
+        # macOS: open Terminal.app with claude
+        script = f'''
+        tell application "Terminal"
+            activate
+            do script "cd '{steps_dir}' && '{claude_path}' \\"{first_msg}\\""
+        end tell
+        '''
+        subprocess.run(["osascript", "-e", script], timeout=10)
+
+    elif sys.platform == "win32":
+        # Windows: open cmd with claude
+        cmd = f'start cmd /k "cd /d {steps_dir} && {claude_path} "{first_msg}""'
+        subprocess.run(cmd, shell=True, timeout=10)
+
+    else:
+        # Linux fallback
+        subprocess.Popen(
+            ["x-terminal-emulator", "-e",
+             f"bash -c 'cd {steps_dir} && {claude_path} \"{first_msg}\"'"],
+        )
+
+
 def _run_one_step(marker, label, full_prompt):
     """Write step prompt to .md file."""
     with _pipe_lock:
@@ -1040,6 +1116,7 @@ class VMMCP_OT_run_pipeline(Operator):
 
         # Write ALL step files at once
         steps = _pipe["steps"]
+        steps_dir = _steps_dir()
         for i, (marker, label, step_text) in enumerate(steps):
             full_prompt = _pipe["history"] + "\n\n" + step_text
             _write_step_file(i, marker, label, full_prompt)
@@ -1050,15 +1127,20 @@ class VMMCP_OT_run_pipeline(Operator):
         _write_current_step_pointer(0, first_path)
 
         _pipe["step_idx"] = 1
-        steps_dir = _steps_dir()
-        props.pipeline_status = f"Step 1/{len(steps)}: {label} — tell Claude to read {steps_dir}"
         props.pipeline_running = len(steps) > 1
 
-        # Copy the instruction to clipboard
-        instruction = f"Read and execute the step in {first_path}"
-        context.window_manager.clipboard = instruction
+        # Launch a fresh Claude Code terminal session
+        try:
+            _launch_claude_terminal(steps_dir, first_path)
+            props.pipeline_status = f"Step 1/{len(steps)}: {label} — Claude Code launched"
+            self.report({"INFO"}, f"Claude Code terminal opened with {len(steps)} steps")
+        except Exception as exc:
+            # Fallback: copy to clipboard if terminal launch fails
+            instruction = f"Read and execute the step in {first_path}"
+            context.window_manager.clipboard = instruction
+            props.pipeline_status = f"Step 1/{len(steps)}: {label} — paste clipboard in Claude Code"
+            self.report({"WARNING"}, f"Terminal launch failed ({exc}), instruction copied to clipboard")
 
-        self.report({"INFO"}, f"{len(steps)} steps written to {steps_dir}")
         return {"FINISHED"}
 
 
@@ -1100,14 +1182,15 @@ class VMMCP_OT_next_step(Operator):
                                  f"step_{idx:02d}_{marker.replace('_OK', '')}.md")
         _write_current_step_pointer(idx, step_path)
 
-        # Copy instruction to clipboard
-        context.window_manager.clipboard = f"Read and execute the step in {step_path}"
+        # Copy instruction to clipboard — user pastes in the existing Claude terminal
+        instruction = f"Read and execute the step in {step_path}"
+        context.window_manager.clipboard = instruction
 
         _pipe["step_idx"] = idx + 1
         remaining = len(steps) - _pipe["step_idx"]
-        props.pipeline_status = f"Step {idx + 1}/{len(steps)}: {label} — tell Claude to read the file"
+        props.pipeline_status = f"Step {idx + 1}/{len(steps)}: {label} — paste in Claude terminal"
         props.pipeline_running = remaining > 0
-        self.report({"INFO"}, f"Step ready: {label} — paste instruction in Claude Code")
+        self.report({"INFO"}, f"Step ready: {label} — Cmd+V in Claude Code terminal")
         return {"FINISHED"}
 
 
