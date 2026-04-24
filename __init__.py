@@ -118,8 +118,10 @@ def _look_at(obj, target):
 
 
 def _setup_cameras(context, mesh, props):
-    center, _min_v, _max_v, _size, radius = _world_bbox(mesh)
+    center, _min_v, _max_v, size, radius = _world_bbox(mesh)
     distance = radius * props.camera_distance
+    # Use the full 3D diagonal so the mesh is always fully visible regardless of view axis
+    ortho_scale = size.length * 1.15
 
     if props.cleanup_cameras:
         vmmcp_names = {f"VMMCP_{v.upper()}_Camera" for v, _ in CAMERA_SPECS}
@@ -145,8 +147,11 @@ def _setup_cameras(context, mesh, props):
             continue
         cam_obj.location = center + axis.normalized() * distance
         _look_at(cam_obj, center)
-        cam_obj.data.lens = 70
+        cam_obj.data.type = "ORTHO"
+        cam_obj.data.ortho_scale = ortho_scale
         cam_obj.data.clip_end = max(distance * 10.0, 1000.0)
+        cam_obj.data.show_passepartout = True
+        cam_obj.data.passepartout_alpha = 1.0
         cameras[view_name] = cam_obj.name
     return cameras
 
@@ -309,15 +314,19 @@ def _build_prompt(context, mesh, cameras, videos, props):
 
         "FULL PIPELINE TO EXECUTE:\n\n"
 
-        "STEP 0 — CAMERA FRAMING:\n"
-        "Before anything else, adjust EVERY camera listed above so that the complete\n"
-        "mesh is visible from tip to toe with a small margin.\n"
-        "For each camera:\n"
-        "  a) Switch to orthographic projection (camera.data.type = 'ORTHO')\n"
-        "  b) Set ortho_scale = mesh_bbox_diagonal * 1.15 (15% margin)\n"
-        "  c) Reposition if needed so the mesh center is in frame\n"
-        "  d) Verify by rendering a preview — the mesh must be fully visible\n"
-        "  e) Do NOT skip this step even if cameras appear correctly placed\n\n"
+        "STEP 0 — CAMERA FRAMING VERIFICATION:\n"
+        "The addon has already configured every VMMCP camera:\n"
+        "  - Orthographic projection (type = 'ORTHO')\n"
+        "  - ortho_scale = mesh_bbox_diagonal * 1.15 (15 % margin)\n"
+        "  - passepartout_alpha = 1.0 (full black mask outside frame)\n"
+        "Your task is to VERIFY and CORRECT each camera before proceeding:\n"
+        "  a) Switch to each VMMCP camera in turn\n"
+        "  b) Confirm the complete mesh (tip to toe) is fully inside the frame\n"
+        "  c) If the mesh is not centered or partially clipped, reposition the camera\n"
+        "     so the mesh bbox center aligns with the camera's line of sight, then\n"
+        "     increase ortho_scale if necessary until the mesh fits with margin\n"
+        "  d) Do NOT change camera.data.type away from 'ORTHO'\n"
+        "  e) Do NOT skip any camera — all viewpoints must be verified\n\n"
 
         "STEP 1 — MOTION EXTRACTION:\n"
         "Run 4D-Humans (HMR2.0) on ALL provided reference videos independently.\n"
