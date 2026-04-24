@@ -1171,6 +1171,59 @@ class VMMCP_OT_stop_pipeline(Operator):
         return {"FINISHED"}
 
 
+class VMMCP_OT_reset_pipeline(Operator):
+    """Reset pipeline to Step 0 and clear all animation/keyframes in Blender."""
+    bl_idname = "video_mocap.reset_pipeline"
+    bl_label = "Reset Pipeline"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        props = context.scene.vmmcp
+
+        # Reset pipeline state
+        with _pipe_lock:
+            _pipe["running"] = False
+            _pipe["step_idx"] = 0
+            _pipe["steps"] = []
+            _pipe["history"] = ""
+            _pipe["status"] = ""
+            _pipe["error"] = ""
+            _pipe["thread"] = None
+
+        # Clear step marker
+        context.scene["vmmcp_step_done"] = ""
+        props.pipeline_running = False
+        props.pipeline_status = "Reset — ready to start"
+
+        # Clear all animation data on armatures linked to the mesh
+        mesh_obj = bpy.data.objects.get(props.mesh_object)
+        if mesh_obj:
+            for mod in mesh_obj.modifiers:
+                if mod.type == "ARMATURE" and mod.object:
+                    arm = mod.object
+                    if arm.animation_data and arm.animation_data.action:
+                        bpy.data.actions.remove(arm.animation_data.action)
+                        self.report({"INFO"}, f"Cleared animation on {arm.name}")
+
+        # Send reset message to Claude Code
+        reset_prompt = (
+            "PIPELINE RESET\n"
+            "==============\n"
+            "The user has reset the motion capture pipeline.\n"
+            "All previous steps are cancelled. Animation data has been cleared.\n"
+            "Forget all previous VMMCP step context.\n"
+            "Wait for the next step prompt — do not take any action now.\n"
+            "Confirm by executing: bpy.context.scene['vmmcp_step_done'] = 'RESET_OK'\n"
+        )
+        try:
+            _send_to_claude_app(reset_prompt)
+            self.report({"INFO"}, "Pipeline reset — sent to Claude Code")
+        except Exception as exc:
+            self.report({"WARNING"}, f"Reset done locally but failed to notify Claude: {exc}")
+
+        return {"FINISHED"}
+
+
 # ------------------------------------------------------------------
 # Panel — minimal UI
 # ------------------------------------------------------------------
@@ -1270,6 +1323,12 @@ class VMMCP_PT_panel(Panel):
             box.operator("video_mocap.run_pipeline", icon="PLAY",
                          text="Start Pipeline")
 
+        # Reset button — always visible when pipeline has been started
+        if steps:
+            box.separator()
+            box.operator("video_mocap.reset_pipeline", icon="FILE_REFRESH",
+                         text="Reset (back to Step 0)")
+
         # Estimator info
         layout.separator()
         info = layout.box()
@@ -1288,6 +1347,7 @@ classes = (
     VMMCP_OT_run_pipeline,
     VMMCP_OT_next_step,
     VMMCP_OT_stop_pipeline,
+    VMMCP_OT_reset_pipeline,
     VMMCP_PT_panel,
 )
 
