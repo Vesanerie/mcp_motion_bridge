@@ -1,144 +1,113 @@
-# Video Mocap MCP — Blender addon
+# Video Mocap MCP - Blender add-on
 
-Vidéo → MediaPipe → armature Blender → retarget Rigify / Mixamo, pilotable
-depuis Claude via BlenderMCP.
+Add-on Blender pour preparer une scene de rigging/animation pilotee par Claude
+via BlenderMCP.
 
-## Architecture
+Le but n'est pas de faire une mocap MediaPipe locale. Le flux attendu est :
 
-```
-  ┌──────────────┐  MCP   ┌──────────────┐ socket ┌─────────────────────┐
-  │ Claude (chat)│───────▶│ blender-mcp  │───────▶│  Blender (addon.py) │
-  └──────────────┘        │   server     │        │  + video_mocap_mcp  │
-                          └──────────────┘        └──────────┬──────────┘
-                                                             │ subprocess
-                                                             ▼
-                                                   ┌──────────────────┐
-                                                   │ external python  │
-                                                   │  (mediapipe)     │
-                                                   └──────────────────┘
-                                                             │ JSON
-                                                             ▼
-                                                     landmarks.json
-                                                             │
-                                                             ▼
-                                                Armature + animation
-                                                             │
-                                                             ▼
-                                                   Retarget → Rigify/Mixamo
+```text
+Videos / image sequence
+        +
+Mesh Blender
+        +
+6 cameras d'analyse: top, bottom, front, back, left, right
+        |
+        v
+Video Mocap MCP add-on
+        |
+        v
+Requete structuree pour Claude / BlenderMCP
+        |
+        v
+Claude inspecte la scene Blender, cree le rig, puis anime les memes bones
 ```
 
-`video_mocap_mcp` est un addon Blender classique. BlenderMCP (ahujasid) a
-déjà l'outil `execute_blender_code`, donc Claude peut appeler les opérateurs
-de l'addon comme n'importe quel code Blender. Pas besoin d'écrire un serveur
-MCP dédié.
+## Pipeline
 
-## Prérequis
+### 1. Rig Mesh
 
-1. **Blender 3.6+** (testé 4.x aussi).
-2. **Un Python externe avec mediapipe** (le Python embarqué de Blender n'est pas
-   recommandé pour mediapipe). Au choix :
-   ```bash
-   python3 -m venv ~/mp_env
-   source ~/mp_env/bin/activate        # Windows: ~\mp_env\Scripts\activate
-   pip install mediapipe opencv-python
-   ```
-   Note le chemin de l'exécutable Python (`which python3` / `where python`),
-   ou définis la variable d'env `VIDEO_MOCAP_PYTHON`.
-3. **BlenderMCP** installé et fonctionnel (https://github.com/ahujasid/blender-mcp).
+Le bouton `Rig Mesh` :
 
-## Installation de l'addon
+- prend le mesh choisi dans le panneau `Mocap`;
+- cree ou met a jour les cameras `VMMCP_FRONT_Camera`,
+  `VMMCP_BACK_Camera`, `VMMCP_LEFT_Camera`, `VMMCP_RIGHT_Camera`,
+  `VMMCP_TOP_Camera`, `VMMCP_BOTTOM_Camera`;
+- collecte les infos utiles du mesh : vertex count, polygons, bounding box,
+  transforms, modifiers, materials, shape keys;
+- genere une requete MCP dans un text block Blender nomme
+  `VMMCP_Rig_Mesh_Request`;
+- copie aussi cette requete dans le presse-papiers.
 
-1. Zipper le dossier `video_mocap_mcp/` :
-   ```bash
-   cd /path/to/parent
-   zip -r video_mocap_mcp.zip video_mocap_mcp
-   ```
-2. Blender → Edit → Preferences → Add-ons → Install → choisir le zip → cocher
-   "Video Mocap MCP".
-3. Dans la vue 3D, onglet `Mocap` de la sidebar (touche N).
+Cette requete demande a Claude, via BlenderMCP, d'inspecter le mesh et les six
+vues camera, puis de creer une armature adaptee au mesh. Le mesh doit etre lie
+aux bones crees, avec des controles utilisables quand c'est pertinent.
 
-## Utilisation manuelle (sans Claude)
+### 2. Animate
 
-1. Renseigner **Video** (chemin absolu vers ton MP4).
-2. Renseigner **External Python** (chemin vers le Python qui a mediapipe).
-3. (Optionnel) Choisir **Target rig** = Rigify ou Mixamo, et sélectionner
-   l'objet armature cible.
-4. Cliquer sur **Run full pipeline**.
+Le bouton `Animate` :
 
-## Utilisation via Claude (BlenderMCP)
+- reprend le meme mesh;
+- utilise les videos ou la suite d'images fournies dans le panneau;
+- cree ou met a jour le setup camera si l'option est active;
+- genere une requete MCP dans `VMMCP_Animate_Request`;
+- copie la requete dans le presse-papiers.
 
-Une fois BlenderMCP connecté, demande à Claude par exemple :
+Cette requete demande a Claude d'analyser les references video/image et
+d'animer le rig existant sur la plage de frames choisie. L'animation doit etre
+bakee sur les bones du rig du mesh, pas sur une armature separee.
 
-> "Sur ma vidéo `/Users/me/dance.mp4`, génère la mocap avec MediaPipe
-> (complexity=2), puis retargette sur mon armature Rigify appelée `rig`."
+## Utilisation
 
-Claude appellera `execute_blender_code` avec un snippet du genre :
+1. Installer et activer BlenderMCP.
+2. Installer cet add-on dans Blender.
+3. Ouvrir la scene contenant le mesh a rigger.
+4. Dans `View3D > Sidebar > Mocap`, choisir le mesh.
+5. Renseigner les sources disponibles :
+   - `Front`
+   - `Back`
+   - `Left`
+   - `Right`
+   - `Top`
+   - `Bottom`
+   - ou `Image Sequence`
+6. Cliquer sur `Rig Mesh`.
+7. Envoyer la requete generee a Claude dans la conversation connectee a
+   BlenderMCP.
+8. Une fois le rig cree, cliquer sur `Animate`.
+9. Envoyer la seconde requete a Claude.
 
-```python
-import bpy
-p = bpy.context.scene.vmmcp
-p.video_path = "/Users/me/dance.mp4"
-p.python_exe = "/Users/me/mp_env/bin/python"
-p.model_complexity = 2
-p.smooth_landmarks = True
-p.target_rig = 'RIGIFY'
-p.target_armature = "rig"
-bpy.ops.video_mocap.run_all()
-```
-
-Ou pas à pas :
-
-```python
-# Step 1: extract
-bpy.ops.video_mocap.extract()
-# Step 2: build MP armature
-bpy.ops.video_mocap.build_armature()
-# Step 3: retarget
-bpy.ops.video_mocap.retarget()
-```
-
-## Opérateurs exposés
+## Operateurs exposes
 
 | Idname | Action |
 |--------|--------|
-| `video_mocap.extract` | Lance MediaPipe sur la vidéo, produit un JSON de landmarks |
-| `video_mocap.build_armature` | Construit `MP_Armature` et bake l'animation des 33 landmarks |
-| `video_mocap.retarget` | Retargette `MP_Armature` → Rigify / Mixamo via Copy Rotation + bake |
-| `video_mocap.run_all` | Enchaîne les trois |
+| `video_mocap.setup_cameras` | Cree ou met a jour les six cameras d'analyse autour du mesh |
+| `video_mocap.rig_mesh` | Prepare la requete MCP pour que Claude cree le rig du mesh |
+| `video_mocap.animate` | Prepare la requete MCP pour que Claude anime le rig depuis les videos/images |
 
-Propriétés dans `bpy.context.scene.vmmcp` :
-- `video_path`, `landmarks_path`, `python_exe`, `fps`
-- `model_complexity` (0/1/2), `min_detection_conf`, `smooth_landmarks`
-- `target_rig` ('NONE' | 'RIGIFY' | 'MIXAMO'), `target_armature`
+## Propriete importante
 
-## Mapping des bones
+Les proprietes sont disponibles dans `bpy.context.scene.vmmcp` :
 
-Le MediaPipe Pose ne fournit pas les doigts ni la rotation intrinsèque du bras
-autour de son axe (roll). Le retarget utilise des contraintes `Copy Rotation`
-en espace LOCAL, ce qui respecte le roll de l'armature cible. Bones mappés :
+- `mesh_object`
+- `front_video`, `back_video`, `left_video`, `right_video`
+- `top_video`, `bottom_video`
+- `image_sequence_dir`
+- `frame_start`, `frame_end`
+- `create_camera_setup`
+- `camera_distance`
+- `request_text_name`
 
-- Torse : HIPS, SPINE, NECK
-- Bras gauche/droit : upperarm, forearm, hand
-- Jambes gauche/droite : upperleg, lowerleg, foot
+## Limite MCP importante
 
-Pas de doigts (MediaPipe Pose ne les donne pas — il faudrait combiner Hand
-Landmarker).
-
-## Limites connues
-
-- Pas de reconstruction du roll des os longs (impossible depuis un seul flux).
-- Mouvements rapides → lissage recommandé (`smooth_landmarks=True`).
-- Profondeur (Z) de MediaPipe est bruyante, l'animation peut jitter en
-  perspective → appliquer un filtre Butterworth via l'éditeur graphique après
-  coup si besoin.
-- Rigify : le mapping cible les contrôles FK. Si tu veux de l'IK, bake ensuite
-  avec l'outil "Snap FK → IK" de Rigify.
-- Mixamo : les noms de bones varient (`mixamorig:Hips` vs `mixamorig1:Hips`).
-  Le retargeter fait un match par suffixe pour tolérer ça.
+Un add-on Blender ne peut pas forcer Claude a executer une action tout seul.
+Dans l'architecture BlenderMCP, Claude est le client MCP et Blender expose des
+outils. Cet add-on prepare donc la requete et le contexte de scene; Claude doit
+ensuite utiliser BlenderMCP pour executer le rigging ou l'animation dans Blender.
 
 ## Fichiers
 
-- `__init__.py` — addon, opérateurs, panneau, propriétés
-- `mediapipe_skeleton.py` — construction de l'armature MP + keyframing
-- `retarget.py` — mapping + contraintes + bake
-- `extractor/extract_pose.py` — script externe qui lance mediapipe
+- `__init__.py` - add-on Blender, panneau, boutons, setup cameras, generation
+  des requetes MCP.
+- `mediapipe_skeleton.py`, `retarget.py`, `extractor/extract_pose.py` -
+  anciens fichiers de prototype MediaPipe. Ils ne sont plus appeles par
+  l'add-on principal.

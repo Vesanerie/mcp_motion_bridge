@@ -1,323 +1,348 @@
 bl_info = {
     "name": "Video Mocap MCP",
     "author": "You",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Mocap",
-    "description": "Video -> MediaPipe -> Rigify/Mixamo armature. Scriptable via BlenderMCP.",
+    "description": "Prepare mesh rigging and animation requests for Claude via BlenderMCP.",
     "category": "Animation",
 }
 
-import bpy
 import json
-import os
-import sys
-import subprocess
-import tempfile
 
-from bpy.props import StringProperty, BoolProperty, EnumProperty, FloatProperty, IntProperty
+import bpy
+from bpy.props import BoolProperty, FloatProperty, IntProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup
+from mathutils import Vector
 
-from .mediapipe_skeleton import (
-    MEDIAPIPE_BONES,
-    MEDIAPIPE_PARENTS,
-    create_mediapipe_armature,
-    apply_landmarks_to_armature,
+
+CAMERA_SPECS = (
+    ("front", Vector((0.0, -1.0, 0.0))),
+    ("back", Vector((0.0, 1.0, 0.0))),
+    ("left", Vector((-1.0, 0.0, 0.0))),
+    ("right", Vector((1.0, 0.0, 0.0))),
+    ("top", Vector((0.0, 0.0, 1.0))),
+    ("bottom", Vector((0.0, 0.0, -1.0))),
 )
-from .retarget import (
-    RIGIFY_BONE_MAP,
-    MIXAMO_BONE_MAP,
-    retarget_animation,
-)
 
 
-# ------------------------------------------------------------------
-# Properties
-# ------------------------------------------------------------------
 class VMMCP_Props(PropertyGroup):
-    video_path: StringProperty(
-        name="Video",
-        description="Path to the reference video",
-        subtype='FILE_PATH',
+    mesh_object: StringProperty(
+        name="Mesh",
+        description="Mesh object Claude must rig and animate",
         default="",
     )
-    landmarks_path: StringProperty(
-        name="Landmarks JSON",
-        description="Where the extractor writes landmarks (auto if empty)",
-        subtype='FILE_PATH',
+    front_video: StringProperty(name="Front", subtype="FILE_PATH", default="")
+    back_video: StringProperty(name="Back", subtype="FILE_PATH", default="")
+    left_video: StringProperty(name="Left", subtype="FILE_PATH", default="")
+    right_video: StringProperty(name="Right", subtype="FILE_PATH", default="")
+    top_video: StringProperty(name="Top", subtype="FILE_PATH", default="")
+    bottom_video: StringProperty(name="Bottom", subtype="FILE_PATH", default="")
+    image_sequence_dir: StringProperty(
+        name="Image Sequence",
+        description="Optional folder containing an image sequence",
+        subtype="DIR_PATH",
         default="",
     )
-    python_exe: StringProperty(
-        name="External Python",
-        description="Python with mediapipe installed (leave empty to auto-detect)",
-        subtype='FILE_PATH',
-        default="",
+    frame_start: IntProperty(name="Start", default=1, min=1)
+    frame_end: IntProperty(name="End", default=250, min=1)
+    camera_distance: FloatProperty(
+        name="Camera Distance",
+        description="Multiplier based on the mesh bounding box size",
+        default=2.4,
+        min=0.5,
+        max=20.0,
     )
-    model_complexity: IntProperty(
-        name="Model complexity",
-        description="MediaPipe model complexity (0 fast, 1 balanced, 2 accurate)",
-        default=1, min=0, max=2,
-    )
-    min_detection_conf: FloatProperty(
-        name="Min detection conf",
-        default=0.5, min=0.0, max=1.0,
-    )
-    smooth_landmarks: BoolProperty(
-        name="Smooth landmarks",
+    create_camera_setup: BoolProperty(
+        name="Create/Update 6 Cameras",
+        description="Create top, bottom, front, back, left and right cameras around the mesh",
         default=True,
     )
-    target_rig: EnumProperty(
-        name="Target rig",
-        items=[
-            ('NONE', "None (raw mediapipe armature only)", ""),
-            ('RIGIFY', "Rigify", ""),
-            ('MIXAMO', "Mixamo", ""),
-        ],
-        default='NONE',
-    )
-    target_armature: StringProperty(
-        name="Target armature",
-        description="Name of the target Rigify/Mixamo armature object",
+    request_text_name: StringProperty(
+        name="Last Request",
+        description="Name of the Blender text block containing the latest MCP request",
         default="",
     )
-    fps: FloatProperty(
-        name="FPS",
-        description="Frame rate of the source video (0 = read from JSON)",
-        default=0.0, min=0.0,
+
+
+def _abspath(path):
+    return bpy.path.abspath(path) if path else ""
+
+
+def _target_mesh(context, props):
+    obj = bpy.data.objects.get(props.mesh_object) if props.mesh_object else None
+    if obj is None and context.object and context.object.type == "MESH":
+        obj = context.object
+        props.mesh_object = obj.name
+    if obj is None or obj.type != "MESH":
+        return None
+    return obj
+
+
+def _world_bbox(obj):
+    points = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    center = sum(points, Vector()) / len(points)
+    min_v = Vector((min(p.x for p in points), min(p.y for p in points), min(p.z for p in points)))
+    max_v = Vector((max(p.x for p in points), max(p.y for p in points), max(p.z for p in points)))
+    size = max_v - min_v
+    radius = max(size.length * 0.5, 0.5)
+    return center, min_v, max_v, size, radius
+
+
+def _look_at(obj, target):
+    direction = target - obj.location
+    if direction.length < 1e-6:
+        return
+    obj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
+
+
+def _setup_cameras(context, mesh, props):
+    center, _min_v, _max_v, _size, radius = _world_bbox(mesh)
+    distance = radius * props.camera_distance
+    cameras = {}
+
+    for view_name, axis in CAMERA_SPECS:
+        cam_name = f"VMMCP_{view_name.upper()}_Camera"
+        cam_obj = bpy.data.objects.get(cam_name)
+        if cam_obj is None:
+            cam_data = bpy.data.cameras.new(cam_name)
+            cam_obj = bpy.data.objects.new(cam_name, cam_data)
+            context.collection.objects.link(cam_obj)
+        elif cam_obj.type != "CAMERA":
+            continue
+
+        cam_obj.location = center + axis.normalized() * distance
+        _look_at(cam_obj, center)
+        cam_obj.data.lens = 70
+        cam_obj.data.clip_end = max(distance * 10.0, 1000.0)
+        cameras[view_name] = cam_obj.name
+
+    return cameras
+
+
+def _mesh_summary(obj):
+    mesh = obj.data
+    center, min_v, max_v, size, _radius = _world_bbox(obj)
+    modifiers = [{"name": m.name, "type": m.type, "show_viewport": m.show_viewport} for m in obj.modifiers]
+    materials = [slot.material.name for slot in obj.material_slots if slot.material]
+    shape_keys = []
+    if mesh.shape_keys:
+        shape_keys = [key.name for key in mesh.shape_keys.key_blocks]
+
+    return {
+        "name": obj.name,
+        "data_name": mesh.name,
+        "vertex_count": len(mesh.vertices),
+        "edge_count": len(mesh.edges),
+        "polygon_count": len(mesh.polygons),
+        "world_location": list(obj.location),
+        "world_rotation_euler": list(obj.rotation_euler),
+        "world_scale": list(obj.scale),
+        "bbox_min": list(min_v),
+        "bbox_max": list(max_v),
+        "bbox_size": list(size),
+        "bbox_center": list(center),
+        "modifiers": modifiers,
+        "materials": materials,
+        "shape_keys": shape_keys,
+    }
+
+
+def _media_sources(props):
+    sources = {
+        "front": _abspath(props.front_video),
+        "back": _abspath(props.back_video),
+        "left": _abspath(props.left_video),
+        "right": _abspath(props.right_video),
+        "top": _abspath(props.top_video),
+        "bottom": _abspath(props.bottom_video),
+        "image_sequence_dir": _abspath(props.image_sequence_dir),
+    }
+    return {key: value for key, value in sources.items() if value}
+
+
+def _write_text(name, content):
+    text = bpy.data.texts.get(name) or bpy.data.texts.new(name)
+    text.clear()
+    text.write(content)
+    return text
+
+
+def _base_payload(context, mesh, props, cameras):
+    return {
+        "addon": "video_mocap_mcp",
+        "blend_file": bpy.data.filepath,
+        "scene": context.scene.name,
+        "mesh": _mesh_summary(mesh),
+        "camera_setup": cameras,
+        "media_sources": _media_sources(props),
+        "frame_range": {
+            "start": props.frame_start,
+            "end": props.frame_end,
+            "fps": context.scene.render.fps / context.scene.render.fps_base,
+        },
+    }
+
+
+def _request_text(kind, payload):
+    if kind == "rig":
+        task = (
+            "Use BlenderMCP to inspect the mesh and the six scene cameras "
+            "(top, bottom, front, back, left, right). Create an armature that "
+            "matches the mesh anatomy/topology, place bones inside the mesh, "
+            "parent/deform the mesh to that armature, create usable IK/FK "
+            "controls where appropriate, and leave the rig ready for animation."
+        )
+    else:
+        task = (
+            "Use BlenderMCP to inspect the supplied videos or image sequence "
+            "from the six reference views. Animate the existing rig created for "
+            "the mesh so the bones follow the performance. Bake clean keyframes "
+            "on the rig over the requested frame range and keep the mesh bound "
+            "to those same bones."
+        )
+
+    return (
+        "MCP request for Claude / BlenderMCP\n"
+        "===================================\n\n"
+        f"Task: {task}\n\n"
+        "Important constraints:\n"
+        "- Do not generate a separate MediaPipe skeleton.\n"
+        "- The final animation must be applied to the mesh rig bones.\n"
+        "- Use the existing Blender scene as source of truth.\n"
+        "- Use the camera objects listed in the payload as analysis views.\n\n"
+        "Payload JSON:\n"
+        f"{json.dumps(payload, indent=2)}\n"
     )
 
 
-# ------------------------------------------------------------------
-# Operator: extract landmarks from video (runs external python)
-# ------------------------------------------------------------------
-class VMMCP_OT_extract(Operator):
-    """Run MediaPipe on the video and dump landmarks to JSON."""
-    bl_idname = "video_mocap.extract"
-    bl_label = "Extract landmarks"
-    bl_options = {'REGISTER'}
+class VMMCP_OT_setup_cameras(Operator):
+    bl_idname = "video_mocap.setup_cameras"
+    bl_label = "Setup Cameras"
+    bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         props = context.scene.vmmcp
-        video = bpy.path.abspath(props.video_path)
-        if not video or not os.path.isfile(video):
-            self.report({'ERROR'}, f"Video not found: {video}")
-            return {'CANCELLED'}
-
-        # Default output next to the video
-        out_json = bpy.path.abspath(props.landmarks_path) if props.landmarks_path else ""
-        if not out_json:
-            out_json = os.path.splitext(video)[0] + "_landmarks.json"
-            props.landmarks_path = out_json
-
-        py = bpy.path.abspath(props.python_exe) if props.python_exe else _auto_detect_python()
-        if not py:
-            self.report({'ERROR'}, "No external Python found. Set props.python_exe.")
-            return {'CANCELLED'}
-
-        script = os.path.join(os.path.dirname(__file__), "extractor", "extract_pose.py")
-        cmd = [
-            py, script,
-            "--video", video,
-            "--out", out_json,
-            "--complexity", str(props.model_complexity),
-            "--min-detection", str(props.min_detection_conf),
-        ]
-        if props.smooth_landmarks:
-            cmd.append("--smooth")
-
-        print("[video_mocap] running:", " ".join(cmd))
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 30)
-        except Exception as e:
-            self.report({'ERROR'}, f"Extractor failed to launch: {e}")
-            return {'CANCELLED'}
-
-        if proc.returncode != 0:
-            print(proc.stdout)
-            print(proc.stderr)
-            self.report({'ERROR'}, f"Extractor failed (code {proc.returncode}). Check console.")
-            return {'CANCELLED'}
-
-        self.report({'INFO'}, f"Landmarks written: {out_json}")
-        return {'FINISHED'}
+        mesh = _target_mesh(context, props)
+        if mesh is None:
+            self.report({"ERROR"}, "Select or choose a mesh object first.")
+            return {"CANCELLED"}
+        cameras = _setup_cameras(context, mesh, props)
+        self.report({"INFO"}, f"Camera setup ready: {len(cameras)} cameras.")
+        return {"FINISHED"}
 
 
-def _auto_detect_python():
-    """Try to find a python with mediapipe installed."""
-    # Priority: env var, then common system pythons
-    env = os.environ.get("VIDEO_MOCAP_PYTHON")
-    if env and os.path.isfile(env):
-        return env
-    candidates = []
-    if sys.platform == "win32":
-        candidates = ["python", "python3"]
-    else:
-        candidates = ["python3", "python"]
-    for c in candidates:
-        try:
-            r = subprocess.run(
-                [c, "-c", "import mediapipe; print(mediapipe.__version__)"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if r.returncode == 0:
-                return c
-        except Exception:
-            pass
-    return ""
-
-
-# ------------------------------------------------------------------
-# Operator: build mediapipe armature from JSON
-# ------------------------------------------------------------------
-class VMMCP_OT_build_armature(Operator):
-    """Read landmarks JSON and create/animate a MediaPipe armature."""
-    bl_idname = "video_mocap.build_armature"
-    bl_label = "Build MediaPipe armature"
-    bl_options = {'REGISTER', 'UNDO'}
+class VMMCP_OT_rig_mesh(Operator):
+    bl_idname = "video_mocap.rig_mesh"
+    bl_label = "Rig Mesh"
+    bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         props = context.scene.vmmcp
-        path = bpy.path.abspath(props.landmarks_path)
-        if not path or not os.path.isfile(path):
-            self.report({'ERROR'}, f"Landmarks JSON not found: {path}")
-            return {'CANCELLED'}
+        mesh = _target_mesh(context, props)
+        if mesh is None:
+            self.report({"ERROR"}, "Select or choose a mesh object first.")
+            return {"CANCELLED"}
 
-        with open(path, "r") as f:
-            data = json.load(f)
-
-        fps = props.fps if props.fps > 0 else float(data.get("fps", 30.0))
-        frames = data.get("frames", [])
-        if not frames:
-            self.report({'ERROR'}, "No frames in JSON.")
-            return {'CANCELLED'}
-
-        arm_obj = create_mediapipe_armature(name="MP_Armature")
-        apply_landmarks_to_armature(arm_obj, frames, fps=fps, scene=context.scene)
-
-        # Store name for later retargeting
-        context.scene.vmmcp_source_armature = arm_obj.name
-        self.report({'INFO'}, f"Armature '{arm_obj.name}' built ({len(frames)} frames @ {fps:.2f} fps).")
-        return {'FINISHED'}
+        cameras = _setup_cameras(context, mesh, props) if props.create_camera_setup else {}
+        payload = _base_payload(context, mesh, props, cameras)
+        content = _request_text("rig", payload)
+        text = _write_text("VMMCP_Rig_Mesh_Request", content)
+        props.request_text_name = text.name
+        context.window_manager.clipboard = content
+        self.report({"INFO"}, "Rig Mesh MCP request copied and written to Text Editor.")
+        return {"FINISHED"}
 
 
-# ------------------------------------------------------------------
-# Operator: retarget to Rigify / Mixamo
-# ------------------------------------------------------------------
-class VMMCP_OT_retarget(Operator):
-    """Retarget MediaPipe armature animation to a Rigify/Mixamo armature."""
-    bl_idname = "video_mocap.retarget"
-    bl_label = "Retarget"
-    bl_options = {'REGISTER', 'UNDO'}
+class VMMCP_OT_animate(Operator):
+    bl_idname = "video_mocap.animate"
+    bl_label = "Animate"
+    bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         props = context.scene.vmmcp
-        if props.target_rig == 'NONE':
-            self.report({'WARNING'}, "Target rig is NONE, nothing to retarget.")
-            return {'CANCELLED'}
+        mesh = _target_mesh(context, props)
+        if mesh is None:
+            self.report({"ERROR"}, "Select or choose a mesh object first.")
+            return {"CANCELLED"}
 
-        src_name = getattr(context.scene, "vmmcp_source_armature", "")
-        src = bpy.data.objects.get(src_name)
-        if src is None:
-            self.report({'ERROR'}, f"Source armature '{src_name}' not found. Build it first.")
-            return {'CANCELLED'}
+        media = _media_sources(props)
+        if not media:
+            self.report({"ERROR"}, "Add at least one video or image sequence source.")
+            return {"CANCELLED"}
 
-        tgt = bpy.data.objects.get(props.target_armature)
-        if tgt is None or tgt.type != 'ARMATURE':
-            self.report({'ERROR'}, f"Target armature '{props.target_armature}' not found.")
-            return {'CANCELLED'}
-
-        mapping = RIGIFY_BONE_MAP if props.target_rig == 'RIGIFY' else MIXAMO_BONE_MAP
-        retarget_animation(src, tgt, mapping)
-        self.report({'INFO'}, f"Retargeted {src.name} -> {tgt.name} ({props.target_rig}).")
-        return {'FINISHED'}
-
-
-# ------------------------------------------------------------------
-# Operator: run the whole pipeline in one click
-# ------------------------------------------------------------------
-class VMMCP_OT_run_all(Operator):
-    """Extract + build armature + (optional) retarget."""
-    bl_idname = "video_mocap.run_all"
-    bl_label = "Run full pipeline"
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        if bpy.ops.video_mocap.extract() != {'FINISHED'}:
-            return {'CANCELLED'}
-        if bpy.ops.video_mocap.build_armature() != {'FINISHED'}:
-            return {'CANCELLED'}
-        if context.scene.vmmcp.target_rig != 'NONE':
-            bpy.ops.video_mocap.retarget()
-        return {'FINISHED'}
+        cameras = _setup_cameras(context, mesh, props) if props.create_camera_setup else {}
+        payload = _base_payload(context, mesh, props, cameras)
+        content = _request_text("animate", payload)
+        text = _write_text("VMMCP_Animate_Request", content)
+        props.request_text_name = text.name
+        context.window_manager.clipboard = content
+        self.report({"INFO"}, "Animate MCP request copied and written to Text Editor.")
+        return {"FINISHED"}
 
 
-# ------------------------------------------------------------------
-# Panel
-# ------------------------------------------------------------------
 class VMMCP_PT_panel(Panel):
-    bl_label = "Video Mocap (MCP)"
+    bl_label = "Video Mocap MCP"
     bl_idname = "VMMCP_PT_panel"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'Mocap'
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Mocap"
 
     def draw(self, context):
         layout = self.layout
-        p = context.scene.vmmcp
+        props = context.scene.vmmcp
 
         box = layout.box()
-        box.label(text="Source", icon='FILE_MOVIE')
-        box.prop(p, "video_path")
-        box.prop(p, "landmarks_path")
-        box.prop(p, "python_exe")
-        box.prop(p, "fps")
+        box.label(text="Mesh", icon="MESH_DATA")
+        box.prop_search(props, "mesh_object", bpy.data, "objects")
 
         box = layout.box()
-        box.label(text="MediaPipe", icon='ARMATURE_DATA')
-        box.prop(p, "model_complexity")
-        box.prop(p, "min_detection_conf")
-        box.prop(p, "smooth_landmarks")
+        box.label(text="Reference Media", icon="FILE_MOVIE")
+        box.prop(props, "front_video")
+        box.prop(props, "back_video")
+        box.prop(props, "left_video")
+        box.prop(props, "right_video")
+        box.prop(props, "top_video")
+        box.prop(props, "bottom_video")
+        box.prop(props, "image_sequence_dir")
 
         box = layout.box()
-        box.label(text="Retarget", icon='OUTLINER_OB_ARMATURE')
-        box.prop(p, "target_rig")
-        if p.target_rig != 'NONE':
-            box.prop_search(p, "target_armature", bpy.data, "objects")
+        box.label(text="MCP Setup", icon="CAMERA_DATA")
+        row = box.row(align=True)
+        row.prop(props, "frame_start")
+        row.prop(props, "frame_end")
+        box.prop(props, "create_camera_setup")
+        box.prop(props, "camera_distance")
+        box.operator("video_mocap.setup_cameras", icon="CAMERA_DATA")
 
         layout.separator()
         col = layout.column(align=True)
-        col.operator("video_mocap.extract", icon='PLAY')
-        col.operator("video_mocap.build_armature", icon='ARMATURE_DATA')
-        col.operator("video_mocap.retarget", icon='CON_ARMATURE')
-        layout.separator()
-        layout.operator("video_mocap.run_all", icon='SEQ_SEQUENCER')
+        col.operator("video_mocap.rig_mesh", icon="ARMATURE_DATA")
+        col.operator("video_mocap.animate", icon="PLAY")
+        if props.request_text_name:
+            layout.label(text=f"Request: {props.request_text_name}", icon="TEXT")
 
 
-# ------------------------------------------------------------------
-# Register
-# ------------------------------------------------------------------
 classes = (
     VMMCP_Props,
-    VMMCP_OT_extract,
-    VMMCP_OT_build_armature,
-    VMMCP_OT_retarget,
-    VMMCP_OT_run_all,
+    VMMCP_OT_setup_cameras,
+    VMMCP_OT_rig_mesh,
+    VMMCP_OT_animate,
     VMMCP_PT_panel,
 )
 
 
 def register():
-    for c in classes:
-        bpy.utils.register_class(c)
+    for cls in classes:
+        bpy.utils.register_class(cls)
     bpy.types.Scene.vmmcp = bpy.props.PointerProperty(type=VMMCP_Props)
-    bpy.types.Scene.vmmcp_source_armature = bpy.props.StringProperty(default="")
 
 
 def unregister():
-    for c in reversed(classes):
-        bpy.utils.unregister_class(c)
-    del bpy.types.Scene.vmmcp
-    del bpy.types.Scene.vmmcp_source_armature
+    if hasattr(bpy.types.Scene, "vmmcp"):
+        del bpy.types.Scene.vmmcp
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
 
 
 if __name__ == "__main__":
