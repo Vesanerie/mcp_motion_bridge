@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MCP_Motion_Bridge",
     "author": "You",
-    "version": (0, 8, 0),
+    "version": (0, 8, 1),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Mocap",
     "description": "Prepare motion capture context for Claude Code via BlenderMCP.",
@@ -58,6 +58,33 @@ class VMMCP_Props(PropertyGroup):
             ("female", "Female", ""),
         ],
         default="neutral",
+    )
+    video_mode: EnumProperty(
+        name="Video Mode",
+        items=[
+            ("MULTI_FILE", "One File per View", "One video file per camera angle"),
+            ("SINGLE_FILE", "Single File – Multi-Angle",
+             "One video containing all angles at once (split-screen or sequential)"),
+        ],
+        default="MULTI_FILE",
+    )
+    multi_angle_video: StringProperty(
+        name="Multi-Angle Video",
+        description="Video file that contains all angles simultaneously or sequentially",
+        subtype="FILE_PATH",
+        default="",
+    )
+    video_layout: EnumProperty(
+        name="Layout",
+        items=[
+            ("AUTO",       "Auto-detect",    "Claude detects the layout automatically"),
+            ("2x1",        "2×1 side-by-side", "Two angles side by side"),
+            ("1x2",        "1×2 stacked",    "Two angles stacked vertically"),
+            ("2x2",        "2×2 grid",       "Four angles in a 2×2 grid"),
+            ("3x2",        "3×2 grid",       "Six angles in a 3×2 grid"),
+            ("SEQUENTIAL", "Sequential",     "Angles appear one after another in time"),
+        ],
+        default="AUTO",
     )
     front_video: StringProperty(name="Front", subtype="FILE_PATH", default="")
     back_video: StringProperty(name="Back", subtype="FILE_PATH", default="")
@@ -181,6 +208,11 @@ def _mesh_summary(obj):
 
 
 def _video_sources(props):
+    if props.video_mode == "SINGLE_FILE":
+        path = _abspath(props.multi_angle_video)
+        if path and os.path.isfile(path):
+            return {"_single_file": path, "_layout": props.video_layout}
+        return {}
     sources = {
         "front": _abspath(props.front_video),
         "back": _abspath(props.back_video),
@@ -261,9 +293,22 @@ def _export_txt(content, blend_filepath):
 # The one prompt that tells Claude Code everything
 # ------------------------------------------------------------------
 def _build_prompt(context, mesh, cameras, videos, props):
+    single_file_mode = "_single_file" in videos
+
+    if single_file_mode:
+        single_path = videos["_single_file"]
+        layout = videos.get("_layout", "AUTO")
+        ref_videos_payload = {
+            "mode": "single_file_multi_angle",
+            "video_path": single_path,
+            "layout": layout,
+        }
+    else:
+        ref_videos_payload = videos
+
     payload = {
         "addon": "video_mocap_mcp",
-        "version": "0.8.0",
+        "version": "0.8.1",
         "blend_file": bpy.data.filepath,
         "scene": context.scene.name,
         "mesh": _mesh_summary(mesh),
@@ -273,7 +318,7 @@ def _build_prompt(context, mesh, cameras, videos, props):
             "vmmcp_prefix": "VMMCP_",
             "deletable": "Any camera whose name does NOT start with 'VMMCP_' and is NOT the protected_camera may be deleted.",
         },
-        "reference_videos": videos,
+        "reference_videos": ref_videos_payload,
         "frame_range": {
             "start": props.frame_start,
             "end": props.frame_end,
@@ -281,8 +326,43 @@ def _build_prompt(context, mesh, cameras, videos, props):
         },
     }
 
-    video_list = "\n".join(f"  - {view}: {path}" for view, path in videos.items())
     camera_list = "\n".join(f"  - {view}: {name}" for view, name in cameras.items())
+
+    if single_file_mode:
+        video_section = (
+            "REFERENCE VIDEO (single file — multiple angles):\n"
+            f"  Path   : {single_path}\n"
+            f"  Layout : {layout}\n"
+            "  Each angle region must be treated as a fully independent viewpoint.\n"
+        )
+    else:
+        video_section = (
+            "REFERENCE VIDEOS (one per viewpoint):\n"
+            + "\n".join(f"  - {view}: {path}" for view, path in videos.items())
+        )
+
+    step_0b = (
+        "STEP 0b — VIDEO SPLITTING (single-file multi-angle mode):\n"
+        "The reference video contains multiple camera angles in a single file.\n"
+        f"Declared layout: {layout}\n"
+        "Before running the pose estimator, split the video into per-angle clips:\n"
+        "  a) If layout is AUTO, inspect the first frame to detect the grid or\n"
+        "     sequential structure (number of panels, their positions).\n"
+        "  b) For each angle region, crop and save as a temporary file:\n"
+        "       ffmpeg -i <input> -vf 'crop=W:H:X:Y' /tmp/vmmcp_angle_<N>.mp4\n"
+        "     Adjust W, H, X, Y to isolate each panel precisely.\n"
+        "  c) Each cropped file is ONE independent viewpoint — NEVER mix frames\n"
+        "     or pixel regions across different angle crops.\n"
+        "  d) Label each crop by its apparent camera direction (front, back, left,\n"
+        "     right, top, bottom) based on the body pose visible in it.\n"
+        "  e) Use these per-angle files as the sole inputs to STEP 1.\n\n"
+    ) if single_file_mode else ""
+
+    step_1_note = (
+        "Input: the per-angle clips produced in STEP 0b.\n"
+        if single_file_mode else
+        "Run extraction on EVERY available video — do not skip any.\n"
+    )
 
     return (
         "PROMPT FOR CLAUDE CODE (connected to Blender via BlenderMCP)\n"
@@ -297,8 +377,7 @@ def _build_prompt(context, mesh, cameras, videos, props):
         "videos showing a person performing a movement filmed from different\n"
         "angles. Your job is to reproduce that movement on the mesh.\n\n"
 
-        "REFERENCE VIDEOS (one per viewpoint):\n"
-        f"{video_list}\n\n"
+        f"{video_section}\n\n"
 
         "ANALYSIS CAMERAS (already placed in the scene):\n"
         f"{camera_list}\n\n"
@@ -328,8 +407,11 @@ def _build_prompt(context, mesh, cameras, videos, props):
         "  d) Do NOT change camera.data.type away from 'ORTHO'\n"
         "  e) Do NOT skip any camera — all viewpoints must be verified\n\n"
 
+        + step_0b +
+
         "STEP 1 — MOTION EXTRACTION:\n"
-        "Run 4D-Humans (HMR2.0) on ALL provided reference videos independently.\n"
+        "Run 4D-Humans (HMR2.0) on ALL reference videos independently.\n"
+        + step_1_note +
         "The estimator script is at: estimator/run_4dhumans.py in the addon folder.\n"
         "The Python env is ~/hmr2_env (already set up with all patches).\n"
         "Run via subprocess FOR EACH VIDEO:\n"
@@ -337,10 +419,19 @@ def _build_prompt(context, mesh, cameras, videos, props):
         "    estimator/run_4dhumans.py --video <path> --out <path>_<view>.npz\n"
         "Output: per-frame SMPL parameters (72 axis-angle rotations for 24 joints,\n"
         "10 shape params, root translation) saved as .npz.\n"
-        "IMPORTANT: each viewpoint constrains different body parts. Run extraction on\n"
-        "EVERY available video — do not skip any. Use the front/back results as the\n"
-        "primary source, and fuse lateral/top/bottom estimates to resolve ambiguities.\n"
-        "NOTE: HMR2 outputs camera-relative poses. The character animates in place.\n\n"
+        "IMPORTANT: each viewpoint constrains different body parts. Use the front/back\n"
+        "results as the primary source, and fuse lateral/top/bottom estimates to\n"
+        "resolve ambiguities. Every viewpoint must be processed — no skipping.\n"
+        "NOTE: HMR2 outputs camera-relative poses. The character animates in place.\n"
+        "VISUAL AIDS: If the video contains grid overlays, strong lines, measurement\n"
+        "markers, motion capture dots, or scale references printed on the character\n"
+        "or the background, treat them as hard positional constraints:\n"
+        "  - Grid lines → use intersections to infer absolute scale and orientation\n"
+        "  - Markers on the body → lock those landmarks to their pixel positions\n"
+        "    per frame and use them to correct HMR2 estimates where they disagree\n"
+        "  - Strong contrast lines on clothing → use as limb direction cues\n"
+        "  - Scale/measurement rulers → calibrate world-space joint distances\n"
+        "Do NOT ignore these visual aids — they are more reliable than HMR2 priors.\n\n"
 
         "STEP 2 — RIGGING:\n"
         "Inspect the mesh from ALL 6 analysis cameras.\n"
@@ -382,16 +473,17 @@ def _build_prompt(context, mesh, cameras, videos, props):
 
         "STEP 6 — MULTI-ANGLE VERIFICATION AND CORRECTION:\n"
         "This is MANDATORY. Execute it for every available viewpoint, not just 'some'.\n"
-        "For EACH reference video listed above:\n"
+        "For EACH angle (whether a separate file or a crop from the single video):\n"
         "  a) Switch to the corresponding analysis camera\n"
-        "  b) Play back the animation side-by-side with the reference video\n"
+        "  b) Play back the animation side-by-side with the reference footage\n"
         "  c) Check every frame for: limbs penetrating mesh, impossible joint angles,\n"
         "     asymmetric motion that should be symmetric, floating or sliding feet,\n"
-        "     limb positions contradicted by this viewpoint\n"
+        "     limb positions contradicted by this viewpoint; also cross-check against\n"
+        "     any grid overlays, markers, or strong lines visible in the footage\n"
         "  d) If ANY contradiction is found — adjust those keyframes immediately\n"
         "  e) After adjusting, re-verify from ALL other viewpoints to ensure\n"
         "     the correction did not introduce a new error in another view\n"
-        "Loop until ALL viewpoints are consistent with their reference video.\n"
+        "Loop until ALL viewpoints are consistent with their reference footage.\n"
         "Do NOT declare the work done until every viewpoint has passed this check.\n\n"
 
         "HARD CONSTRAINTS:\n"
@@ -437,7 +529,10 @@ class VMMCP_OT_generate(Operator):
 
         videos = _video_sources(props)
         if not videos:
-            self.report({"ERROR"}, "Add at least one reference video.")
+            if props.video_mode == "SINGLE_FILE":
+                self.report({"ERROR"}, "Set a valid multi-angle video file.")
+            else:
+                self.report({"ERROR"}, "Add at least one reference video.")
             return {"CANCELLED"}
 
         cameras = _setup_cameras(context, mesh, props)
@@ -479,12 +574,17 @@ class VMMCP_PT_panel(Panel):
         # Videos
         box = layout.box()
         box.label(text="Reference Videos", icon="FILE_MOVIE")
-        box.prop(props, "front_video")
-        box.prop(props, "back_video")
-        box.prop(props, "left_video")
-        box.prop(props, "right_video")
-        box.prop(props, "top_video")
-        box.prop(props, "bottom_video")
+        box.prop(props, "video_mode", expand=True)
+        if props.video_mode == "SINGLE_FILE":
+            box.prop(props, "multi_angle_video")
+            box.prop(props, "video_layout")
+        else:
+            box.prop(props, "front_video")
+            box.prop(props, "back_video")
+            box.prop(props, "left_video")
+            box.prop(props, "right_video")
+            box.prop(props, "top_video")
+            box.prop(props, "bottom_video")
 
         # Settings
         box = layout.box()
