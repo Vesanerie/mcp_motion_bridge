@@ -76,6 +76,40 @@ class VMMCP_Props(PropertyGroup):
     right_video: StringProperty(name="Right", subtype="FILE_PATH", default="")
     top_video: StringProperty(name="Top", subtype="FILE_PATH", default="")
     bottom_video: StringProperty(name="Bottom", subtype="FILE_PATH", default="")
+    mesh_forward: EnumProperty(
+        name="Mesh Forward",
+        description="Which axis the mesh faces forward along",
+        items=[
+            ("-Y", "-Y (Blender default)", ""),
+            ("+Y", "+Y", ""),
+            ("+X", "+X", ""),
+            ("-X", "-X", ""),
+            ("+Z", "+Z", ""),
+            ("-Z", "-Z", ""),
+        ],
+        default="-Y",
+    )
+    mesh_up: EnumProperty(
+        name="Mesh Up",
+        description="Which axis points up on the mesh",
+        items=[
+            ("+Z", "+Z (Blender default)", ""),
+            ("+Y", "+Y", ""),
+            ("-Y", "-Y", ""),
+            ("-Z", "-Z", ""),
+        ],
+        default="+Z",
+    )
+    rest_pose: EnumProperty(
+        name="Rest Pose",
+        description="Rest pose of the mesh armature",
+        items=[
+            ("T_POSE", "T-Pose", "Arms horizontal, legs straight"),
+            ("A_POSE", "A-Pose", "Arms slightly lowered"),
+            ("CUSTOM", "Custom", "Non-standard rest pose"),
+        ],
+        default="T_POSE",
+    )
     frame_start: IntProperty(name="Start", default=1, min=1)
     frame_end: IntProperty(name="End", default=250, min=1)
     user_camera: StringProperty(name="Protected Camera", default="")
@@ -408,6 +442,11 @@ def _build_context(context, mesh, cameras, videos, props):
         "blend_file": bpy.data.filepath,
         "scene": context.scene.name,
         "mesh": _mesh_summary(mesh),
+        "mesh_orientation": {
+            "forward_axis": props.mesh_forward,
+            "up_axis": props.mesh_up,
+            "rest_pose": props.rest_pose,
+        },
         "camera_setup": cameras,
         "reference_videos": ref,
         "frame_range": {
@@ -436,6 +475,17 @@ def _build_context(context, mesh, cameras, videos, props):
         "CAMERA RULES:\n"
         "  Never delete VMMCP_* cameras.\n" + protected_line +
         "  Any other camera may be deleted if it clutters the scene.\n\n"
+        f"MESH ORIENTATION (CRITICAL for correct animation):\n"
+        f"  Forward axis: {props.mesh_forward}  (direction the mesh faces)\n"
+        f"  Up axis: {props.mesh_up}  (direction pointing up)\n"
+        f"  Rest pose: {props.rest_pose}\n"
+        f"  MediaPipe convention: subject faces camera (-Z), up is -Y, right is +X\n"
+        f"  You MUST build a rotation matrix that maps:\n"
+        f"    MediaPipe forward (-Z) → Mesh forward ({props.mesh_forward})\n"
+        f"    MediaPipe up (-Y)      → Mesh up ({props.mesh_up})\n"
+        f"  Apply this global rotation to ALL joint rotations and root translation\n"
+        f"  BEFORE applying them to the rig. Without this, the animation will be\n"
+        f"  rotated, flipped, or completely wrong.\n\n"
         "HARD CONSTRAINTS (apply to every step):\n"
         "  - Never rename / delete / reparent existing bones\n"
         "  - Never create a new armature if one already exists\n"
@@ -542,25 +592,59 @@ def _build_steps(videos, props):
     steps.append(wrap("STEP_3_OK", "Step 3 — Animation Transfer",
         "Use smpl_to_rig (Step 2b) and root_motion_bone (Step 2c).\n"
         "Skip UNMAPPED joints — do NOT approximate with a wrong bone.\n\n"
+
+        "CRITICAL — AXIS ORIENTATION MAPPING:\n"
+        f"The mesh forward axis is: {props.mesh_forward}\n"
+        f"The mesh up axis is: {props.mesh_up}\n"
+        f"The mesh rest pose is: {props.rest_pose}\n"
+        "MediaPipe outputs in its own coordinate system:\n"
+        "  MediaPipe: X=right, Y=down, Z=away-from-camera (subject faces -Z)\n"
+        "You MUST build a global rotation matrix that maps:\n"
+        f"  MediaPipe forward (-Z) --> Mesh forward ({props.mesh_forward})\n"
+        f"  MediaPipe up (-Y)      --> Mesh up ({props.mesh_up})\n"
+        f"  MediaPipe right (+X)   --> derived from forward x up\n"
+        "Compute this matrix ONCE before the frame loop using scipy:\n"
+        "  from scipy.spatial.transform import Rotation\n"
+        "  # Build source basis (MediaPipe): forward=-Z, up=-Y, right=+X\n"
+        "  # Build target basis: forward=mesh_forward, up=mesh_up\n"
+        "  # global_rot = target_basis @ inverse(source_basis)\n"
+        "Apply global_rot to EVERY axis-angle rotation and root translation.\n"
+        "Without this, the character will face the wrong direction, be flipped,\n"
+        "or have twisted limbs.\n\n"
+
         "BEFORE frame loop (mandatory, build once):\n"
         "  bpy.ops.object.mode_set(mode='EDIT')\n"
         "  rest_offsets = {b.name: b.matrix.to_quaternion()\n"
         "                  for b in armature.data.edit_bones}\n"
         "  bpy.ops.object.mode_set(mode='OBJECT')\n"
         "  rest_inv = {n: q.conjugated() for n, q in rest_offsets.items()}\n\n"
+
         "PER FRAME, PER MAPPED JOINT:\n"
         "  a) aa = smpl_poses[f, joint*3 : joint*3+3]\n"
-        "  b) q  = Quaternion(Rotation.from_rotvec(aa).as_quat()[[3,0,1,2]])\n"
-        "  c) q_bl = Quaternion((q.w, -q.x, q.z, -q.y))   # MediaPipe\n"
-        "  d) final = rest_inv[rig] @ q_bl @ rest_offsets[rig]\n"
-        "  e) pb.rotation_mode = 'QUATERNION'\n"
+        "  b) Convert to rotation: r = Rotation.from_rotvec(aa)\n"
+        "  c) Apply global orientation: r_oriented = global_rot * r\n"
+        "  d) Convert to Blender quaternion:\n"
+        "     q = r_oriented.as_quat()  # scipy [x,y,z,w]\n"
+        "     q_bl = Quaternion((q[3], q[0], q[1], q[2]))  # Blender [w,x,y,z]\n"
+        "  e) Apply rest-offset composition:\n"
+        "     rig_bone = smpl_to_rig[joint]\n"
+        "     final = rest_inv[rig_bone] @ q_bl @ rest_offsets[rig_bone]\n"
+        "  f) pb.rotation_mode = 'QUATERNION'\n"
         "     pb.rotation_quaternion = final\n"
         "     pb.keyframe_insert('rotation_quaternion', frame=f)\n\n"
+
         "ROOT MOTION every frame:\n"
         "  t = smpl_trans[f]\n"
-        "  root_pb.location = Vector((-t[0], t[2], -t[1]))\n"
-        "  root_pb.keyframe_insert('location', frame=f)\n"
-        "Report: bones animated, total keyframes.\n"
+        "  # Apply the same global orientation to translation:\n"
+        "  t_oriented = global_rot.apply(t)\n"
+        "  root_pb.location = Vector(t_oriented)\n"
+        "  root_pb.keyframe_insert('location', frame=f)\n\n"
+
+        "VERIFY on frame 0: the mesh should be in the same pose as the\n"
+        "reference video frame 0. If the character faces the wrong way or\n"
+        "is upside down, the global_rot matrix is wrong — fix it before\n"
+        "continuing.\n"
+        "Report: bones animated, total keyframes, orientation verified.\n"
     ))
 
     steps.append(wrap("STEP_4_OK", "Step 4 — Temporal Smoothing",
@@ -770,6 +854,14 @@ class VMMCP_PT_panel(Panel):
         else:
             for v in ("front", "back", "left", "right", "top", "bottom"):
                 box.prop(props, f"{v}_video")
+
+        # Mesh orientation
+        box = layout.box()
+        box.label(text="Mesh Orientation", icon="ORIENTATION_GLOBAL")
+        row = box.row(align=True)
+        row.prop(props, "mesh_forward")
+        row.prop(props, "mesh_up")
+        box.prop(props, "rest_pose")
 
         # Settings
         box = layout.box()
