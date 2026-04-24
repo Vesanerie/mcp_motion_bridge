@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MCP_Motion_Bridge",
     "author": "You",
-    "version": (0, 8, 1),
+    "version": (0, 9, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Mocap",
     "description": "Prepare motion capture context for Claude Code via BlenderMCP.",
@@ -10,6 +10,9 @@ bl_info = {
 
 import json
 import os
+import shutil
+import subprocess
+import threading
 
 import bpy
 from bpy.props import EnumProperty, FloatProperty, IntProperty, StringProperty
@@ -108,6 +111,8 @@ class VMMCP_Props(PropertyGroup):
         description="Delete all cameras that are not VMMCP analysis cameras and not the protected camera",
         default=False,
     )
+    pipeline_running: bpy.props.BoolProperty(name="Pipeline Running", default=False)
+    pipeline_status: bpy.props.StringProperty(name="Pipeline Status", default="")
 
 
 # ------------------------------------------------------------------
@@ -287,6 +292,322 @@ def _export_txt(content, blend_filepath):
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(content)
     return out_path
+
+
+# ------------------------------------------------------------------
+# Sequential pipeline — state, thread runner, bpy timer
+# ------------------------------------------------------------------
+_pipe = {
+    "running":     False,
+    "step_idx":    0,
+    "steps":       [],   # list of (marker, label, step_text)
+    "history":     "",   # growing log: context + previous responses
+    "status":      "",
+    "error":       "",
+    "thread":      None,
+    "scene_name":  "",
+}
+_pipe_lock = threading.Lock()
+
+
+def _claude_exe():
+    exe = shutil.which("claude")
+    if exe is None:
+        raise RuntimeError("'claude' not found in PATH — install Claude Code CLI.")
+    return exe
+
+
+def _run_one_step(marker, label, full_prompt):
+    """Blocking — runs in a daemon thread."""
+    with _pipe_lock:
+        _pipe["status"] = f"Running {label}…"
+    try:
+        proc = subprocess.Popen(
+            [_claude_exe(), "-p"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        stdout, _ = proc.communicate(input=full_prompt.encode("utf-8"), timeout=900)
+        output = stdout.decode("utf-8", errors="replace")
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        with _pipe_lock:
+            _pipe["error"] = f"{label}: timed out after 15 min"
+            _pipe["running"] = False
+        return
+    except Exception as exc:
+        with _pipe_lock:
+            _pipe["error"] = f"{label}: {exc}"
+            _pipe["running"] = False
+        return
+
+    with _pipe_lock:
+        _pipe["history"] += f"\n\n=== {label} OUTPUT ===\n{output.strip()}"
+        if f"{marker}:" in output:
+            _pipe["status"] = f"{label} — done"
+        else:
+            _pipe["error"] = (
+                f"{label} did not output '{marker}:'. "
+                f"Tail: …{output.strip()[-300:]}"
+            )
+            _pipe["running"] = False
+
+
+def _pipeline_tick():
+    """bpy.app.timers callback — return float to keep firing, None to stop."""
+    with _pipe_lock:
+        if not _pipe["running"]:
+            _sync_status_to_scene()
+            return None
+
+        if _pipe["error"]:
+            _sync_status_to_scene()
+            _pipe["running"] = False
+            return None
+
+        thread = _pipe["thread"]
+        if thread is not None and thread.is_alive():
+            _sync_status_to_scene()
+            return 1.0
+
+        # Thread finished (or first tick) — launch next step
+        idx = _pipe["step_idx"]
+        steps = _pipe["steps"]
+
+        if idx >= len(steps):
+            _pipe["running"] = False
+            _pipe["status"] = f"Pipeline complete — {len(steps)} steps done!"
+            _sync_status_to_scene(finished=True)
+            return None
+
+        marker, label, step_text = steps[idx]
+        full_prompt = _pipe["history"] + "\n\n" + step_text
+        _pipe["step_idx"] = idx + 1
+        _pipe["status"] = f"[{idx + 1}/{len(steps)}] {label}…"
+
+        t = threading.Thread(
+            target=_run_one_step,
+            args=(marker, label, full_prompt),
+            daemon=True,
+        )
+        _pipe["thread"] = t
+        t.start()
+        _sync_status_to_scene()
+
+    return 1.0
+
+
+def _sync_status_to_scene(finished=False):
+    """Write _pipe status into the Blender scene property (called from main thread)."""
+    scene = bpy.data.scenes.get(_pipe.get("scene_name", ""))
+    if scene is None:
+        return
+    props = scene.vmmcp
+    if _pipe["error"]:
+        props.pipeline_status = f"ERROR: {_pipe['error']}"
+        props.pipeline_running = False
+    else:
+        props.pipeline_status = _pipe["status"]
+        props.pipeline_running = not finished and _pipe["running"]
+
+
+# ------------------------------------------------------------------
+# Sequential pipeline — context + step builders
+# ------------------------------------------------------------------
+def _build_context(context, mesh, cameras, videos, props):
+    """Compact shared briefing sent once at the start of the pipeline."""
+    single_file_mode = "_single_file" in videos
+    ref = (
+        {"mode": "single_file_multi_angle",
+         "video_path": videos["_single_file"],
+         "layout": videos.get("_layout", "AUTO")}
+        if single_file_mode else dict(videos)
+    )
+    payload = {
+        "blend_file": bpy.data.filepath,
+        "scene": context.scene.name,
+        "mesh": _mesh_summary(mesh),
+        "camera_setup": cameras,
+        "reference_videos": ref,
+        "frame_range": {
+            "start": props.frame_start,
+            "end": props.frame_end,
+            "fps": context.scene.render.fps / context.scene.render.fps_base,
+        },
+    }
+    cam_lines = "\n".join(f"  {v}: {n}" for v, n in cameras.items())
+    vid_lines = (
+        f"  Single file: {videos['_single_file']}  layout={videos.get('_layout','AUTO')}"
+        if single_file_mode else
+        "\n".join(f"  {v}: {p}" for v, p in videos.items())
+    )
+    protected_line = (
+        f"  Protected: '{props.user_camera.strip()}' — never delete.\n"
+        if props.user_camera.strip() else "  No protected camera.\n"
+    )
+    return (
+        "VMMCP PIPELINE — SHARED CONTEXT\n"
+        "================================\n"
+        "You are Claude Code connected to Blender via BlenderMCP.\n"
+        "Execute autonomously. Do NOT ask the user for input.\n\n"
+        "CAMERAS (ortho, passepartout 1.0):\n" + cam_lines + "\n\n"
+        "REFERENCE VIDEOS:\n" + vid_lines + "\n\n"
+        "CAMERA RULES:\n"
+        "  Never delete VMMCP_* cameras.\n" + protected_line +
+        "  Any other camera may be deleted if it clutters the scene.\n\n"
+        "HARD CONSTRAINTS (apply to every step):\n"
+        "  - Never rename / delete / reparent existing bones\n"
+        "  - Never create a new armature if one already exists\n"
+        "  - Never apply rotations to UNMAPPED bones\n"
+        "  - Bone lengths must stay constant across all frames\n"
+        "  - Set scene FPS to match motion data FPS before keyframing\n"
+        "  - Every provided viewpoint must be processed — no skipping\n\n"
+        f"SCENE PAYLOAD:\n{json.dumps(payload, indent=2)}\n"
+    )
+
+
+def _build_steps(videos, props):
+    """Return list of (marker, label, step_text) — one entry per pipeline step."""
+    single_file_mode = "_single_file" in videos
+    layout = videos.get("_layout", "AUTO") if single_file_mode else "N/A"
+
+    def wrap(marker, label, body):
+        return (marker, label,
+            f"=== {label} ===\n"
+            "Execute ONLY this step. Do NOT start any other step.\n\n"
+            + body +
+            f"\nWhen fully complete output EXACTLY this line as the very last line "
+            f"of your response (nothing after it):\n"
+            f"{marker}: {{\"summary\": \"<one sentence>\"}}\n"
+            "Do NOT output this line until the step is truly done.\n"
+        )
+
+    steps = []
+
+    steps.append(wrap("STEP_0_OK", "Step 0 — Camera Framing",
+        "Verify every VMMCP camera:\n"
+        "  a) Switch to each VMMCP camera in turn\n"
+        "  b) Confirm the complete mesh is fully inside the frame (tip to toe)\n"
+        "  c) If not: reposition so bbox center aligns with line of sight;\n"
+        "     increase ortho_scale until mesh fits with 15% margin\n"
+        "  d) Do NOT change camera.data.type away from 'ORTHO'\n"
+        "  e) Do NOT skip any camera\n"
+    ))
+
+    if single_file_mode:
+        steps.append(wrap("STEP_0b_OK", "Step 0b — Video Splitting",
+            f"The reference video contains multiple angles (layout: {layout}).\n"
+            "  a) If AUTO: inspect first frame to detect grid / sequential structure\n"
+            "  b) Crop each angle: ffmpeg -i <in> -vf 'crop=W:H:X:Y' /tmp/vmmcp_angle_N.mp4\n"
+            "  c) Each crop = one independent viewpoint — no cross-mixing\n"
+            "  d) Label each crop by direction (front/back/left/right/top/bottom)\n"
+            "  e) List the resulting files with their labels before finishing\n"
+        ))
+
+    steps.append(wrap("STEP_1_OK", "Step 1 — Motion Extraction",
+        "PRIMARY: ~/mp_env/bin/python estimator/run_mediapipe_ik.py\n"
+        "  --video <path> --out <path>.npz    (run for EACH video / crop)\n"
+        "COORDINATE CONVERSION (mandatory before any IK):\n"
+        "  MediaPipe X=right Y=down Z=away → Blender: blender = (-mp.x, mp.z, -mp.y)\n"
+        "FALLBACK if MediaPipe fails: ~/hmr2_env via run_4dhumans.py\n"
+        "  WARNING: HMR2 on Apple MPS gives near-static poses on large movements\n"
+        "  — verify output variance (expect std > 0.5° per joint) before trusting.\n"
+        "VISUAL AIDS: grids / markers / strong lines on character → hard constraints.\n"
+        "Report: list of .npz files and their frame counts.\n"
+    ))
+
+    steps.append(wrap("STEP_2a_OK", "Step 2a — Bone Survey",
+        "List EVERY bone in every armature in the scene. Per bone:\n"
+        "  - Exact name (case-sensitive)\n"
+        "  - Parent bone name (or ROOT)\n"
+        "  - Head world position (x y z, 3 decimals)\n"
+        "  - Has vertex weights on the mesh: yes / no\n"
+        "Print the full list before finishing.\n"
+        "RULE: do not rename / delete / reparent / modify any bone.\n"
+        "      Do not create a new armature if one already exists.\n"
+    ))
+
+    steps.append(wrap("STEP_2b_OK", "Step 2b — SMPL→Rig Mapping",
+        "Using the bone list from Step 2a, match each SMPL joint to a rig bone.\n"
+        "SMPL joints: pelvis, left_hip, right_hip, spine1, left_knee, right_knee,\n"
+        "  spine2, left_ankle, right_ankle, spine3, left_foot, right_foot, neck,\n"
+        "  left_collar, right_collar, head, left_shoulder, right_shoulder,\n"
+        "  left_elbow, right_elbow, left_wrist, right_wrist, left_hand, right_hand\n"
+        "Matching order (stop at first hit):\n"
+        "  1. Exact name (case-insensitive, strip DEF-/ORG-/MCH- prefixes)\n"
+        "  2. Partial name (thigh.L→left_hip, forearm.R→right_elbow, spine→spineN…)\n"
+        "  3. Positional proximity to anatomical position on mesh\n"
+        "  4. UNMAPPED — if no match found (do NOT invent a bone)\n"
+        "Output the full smpl_to_rig dict explicitly. Mark UNMAPPEDs clearly.\n"
+    ))
+
+    steps.append(wrap("STEP_2c_OK", "Step 2c — Root Motion Bone",
+        "Find the bone that controls global body position in world space.\n"
+        "Check in order:\n"
+        "  1. Bone with no parent\n"
+        "  2. Named: root, master, COG, center_of_gravity, hips, pelvis, torso\n"
+        "  3. Topmost non-helper bone in hierarchy\n"
+        "  4. Fallback: pelvis-mapped bone from Step 2b\n"
+        "Output: ROOT_MOTION_BONE: <exact bone name>\n"
+        "This bone receives smpl_trans location keyframes every frame (jumps, runs…).\n"
+    ))
+
+    steps.append(wrap("STEP_3_OK", "Step 3 — Animation Transfer",
+        "Use smpl_to_rig (Step 2b) and root_motion_bone (Step 2c).\n"
+        "Skip UNMAPPED joints — do NOT approximate with a wrong bone.\n"
+        "Front/back .npz = base; fuse lateral/top/bottom for ambiguous joints.\n\n"
+        "BEFORE frame loop (mandatory, build once):\n"
+        "  bpy.ops.object.mode_set(mode='EDIT')\n"
+        "  rest_offsets = {b.name: b.matrix.to_quaternion()\n"
+        "                  for b in armature.data.edit_bones}\n"
+        "  bpy.ops.object.mode_set(mode='OBJECT')\n"
+        "  rest_inv = {n: q.conjugated() for n, q in rest_offsets.items()}\n\n"
+        "PER FRAME, PER MAPPED JOINT:\n"
+        "  a) aa = smpl_poses[f, joint*3 : joint*3+3]\n"
+        "  b) q  = Quaternion(Rotation.from_rotvec(aa).as_quat()[[3,0,1,2]])\n"
+        "  c) q_bl = Quaternion((q.w, -q.x, q.z, -q.y))   # MediaPipe→Blender\n"
+        "     or  = Quaternion((q.w,  q.x, q.z, -q.y))   # HMR2/SMPL→Blender\n"
+        "  d) rig = smpl_to_rig[joint]\n"
+        "     final = rest_inv[rig] @ q_bl @ rest_offsets[rig]\n"
+        "  e) pb.rotation_mode = 'QUATERNION'\n"
+        "     pb.rotation_quaternion = final\n"
+        "     pb.keyframe_insert('rotation_quaternion', frame=f)\n\n"
+        "ROOT MOTION every frame:\n"
+        "  t = smpl_trans[f]\n"
+        "  root_pb.location = Vector((-t[0], t[2], -t[1]))  # MediaPipe\n"
+        "  root_pb.keyframe_insert('location', frame=f)\n"
+        "Report: bones animated, total keyframes, frames processed.\n"
+    ))
+
+    steps.append(wrap("STEP_4_OK", "Step 4 — Temporal Smoothing",
+        "Smooth ALL rotation curves with quaternion SLERP or log-quat filter.\n"
+        "NEVER smooth Euler angles (gimbal lock).\n"
+        "Apply 3-frame moving average if jitter remains.\n"
+        "Report: curves smoothed, peak jitter before / after.\n"
+    ))
+
+    steps.append(wrap("STEP_5_OK", "Step 5 — Foot Contact Correction",
+        "Fix foot skating:\n"
+        "  - Detect frames where feet are planted (low velocity + low height)\n"
+        "  - Activate IK on ankle bones for those frame ranges\n"
+        "  - Pin foot to ground plane during contact\n"
+        "Report: contact frame ranges detected, IK ranges applied.\n"
+    ))
+
+    steps.append(wrap("STEP_6_OK", "Step 6 — Multi-Angle Verification",
+        "MANDATORY for every viewpoint:\n"
+        "  a) Switch to the corresponding VMMCP camera\n"
+        "  b) Check every frame: limb penetration, impossible angles, floating feet,\n"
+        "     asymmetry, positions contradicted by this viewpoint,\n"
+        "     mismatch vs grid / markers / strong lines in the footage\n"
+        "  c) If contradiction found: fix those keyframes immediately\n"
+        "  d) After fix: re-verify from ALL other viewpoints\n"
+        "Loop until every viewpoint passes. Do NOT declare done before that.\n"
+        "Report: viewpoints checked, issues found and fixed per viewpoint.\n"
+    ))
+
+    return steps
 
 
 # ------------------------------------------------------------------
@@ -627,6 +948,131 @@ class VMMCP_OT_generate(Operator):
 
 
 # ------------------------------------------------------------------
+# Pipeline operators
+# ------------------------------------------------------------------
+def _validate_scene(context, props):
+    """Shared validation — returns (mesh, videos) or raises."""
+    if props.mesh_source == "SMPL":
+        model_path = bpy.path.abspath(props.smpl_model_path)
+        if not model_path or not os.path.isfile(model_path):
+            raise ValueError("SMPL model file not found — set a valid path.")
+        mesh = _import_smpl_mesh(context, model_path, props.smpl_gender)
+        if mesh is None:
+            raise ValueError("Failed to import SMPL mesh (.pkl / .obj / .npz).")
+        props.mesh_object = mesh.name
+    else:
+        mesh = _target_mesh(context, props)
+        if mesh is None:
+            raise ValueError("Select a mesh object first.")
+    videos = _video_sources(props)
+    if not videos:
+        msg = ("Set a valid multi-angle video file."
+               if props.video_mode == "SINGLE_FILE"
+               else "Add at least one reference video.")
+        raise ValueError(msg)
+    return mesh, videos
+
+
+class VMMCP_OT_generate_steps(Operator):
+    """Write per-step prompt files to VMMCP_Steps/ without running them."""
+    bl_idname = "video_mocap.generate_steps"
+    bl_label = "Generate Step Files"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        props = context.scene.vmmcp
+        try:
+            mesh, videos = _validate_scene(context, props)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        cameras = _setup_cameras(context, mesh, props)
+        ctx_text = _build_context(context, mesh, cameras, videos, props)
+        steps = _build_steps(videos, props)
+
+        base = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else bpy.app.tempdir
+        step_dir = os.path.join(base, "VMMCP_Steps")
+        os.makedirs(step_dir, exist_ok=True)
+
+        ctx_path = os.path.join(step_dir, "VMMCP_Context.txt")
+        with open(ctx_path, "w", encoding="utf-8") as f:
+            f.write(ctx_text)
+
+        for marker, label, step_text in steps:
+            fname = marker.replace(":", "").replace("_OK", "") + ".txt"
+            with open(os.path.join(step_dir, fname), "w", encoding="utf-8") as f:
+                f.write(ctx_text + "\n\n" + step_text)
+
+        self.report({"INFO"}, f"{len(steps)} step files written to {step_dir}")
+        return {"FINISHED"}
+
+
+class VMMCP_OT_run_pipeline(Operator):
+    """Run the full pipeline automatically, one step at a time via claude -p."""
+    bl_idname = "video_mocap.run_pipeline"
+    bl_label = "Run Pipeline"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        props = context.scene.vmmcp
+
+        if _pipe["running"]:
+            self.report({"WARNING"}, "Pipeline already running — stop it first.")
+            return {"CANCELLED"}
+
+        try:
+            _claude_exe()
+        except RuntimeError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        try:
+            mesh, videos = _validate_scene(context, props)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        cameras = _setup_cameras(context, mesh, props)
+        ctx_text = _build_context(context, mesh, cameras, videos, props)
+        steps = _build_steps(videos, props)
+
+        with _pipe_lock:
+            _pipe["running"] = True
+            _pipe["step_idx"] = 0
+            _pipe["steps"] = steps
+            _pipe["history"] = ctx_text
+            _pipe["status"] = "Starting…"
+            _pipe["error"] = ""
+            _pipe["thread"] = None
+            _pipe["scene_name"] = context.scene.name
+
+        props.pipeline_running = True
+        props.pipeline_status = f"Starting — {len(steps)} steps"
+
+        if not bpy.app.timers.is_registered(_pipeline_tick):
+            bpy.app.timers.register(_pipeline_tick, first_interval=0.5)
+
+        self.report({"INFO"}, f"Pipeline started — {len(steps)} steps")
+        return {"FINISHED"}
+
+
+class VMMCP_OT_stop_pipeline(Operator):
+    """Abort the running pipeline."""
+    bl_idname = "video_mocap.stop_pipeline"
+    bl_label = "Stop Pipeline"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        with _pipe_lock:
+            _pipe["running"] = False
+            _pipe["error"] = "Stopped by user."
+        context.scene.vmmcp.pipeline_running = False
+        context.scene.vmmcp.pipeline_status = "Stopped."
+        return {"FINISHED"}
+
+
+# ------------------------------------------------------------------
 # Panel — minimal UI
 # ------------------------------------------------------------------
 class VMMCP_PT_panel(Panel):
@@ -685,16 +1131,37 @@ class VMMCP_PT_panel(Panel):
 
         layout.separator()
 
-        # The one button
-        layout.operator("video_mocap.generate", icon="COPYDOWN", text="Generate Prompt")
-        layout.label(text="Then paste in Claude Code + BlenderMCP", icon="INFO")
+        # Manual mode
+        box = layout.box()
+        box.label(text="Manual Mode", icon="COPYDOWN")
+        box.operator("video_mocap.generate", icon="COPYDOWN", text="Generate Prompt")
+        box.label(text="Paste in Claude Code + BlenderMCP", icon="INFO")
+        box.operator("video_mocap.generate_steps", icon="FILE_TEXT",
+                     text="Generate Step Files Only")
+
+        layout.separator()
+
+        # Auto pipeline
+        box = layout.box()
+        box.label(text="Auto Pipeline", icon="PLAY")
+        if props.pipeline_running:
+            box.label(text=props.pipeline_status, icon="TIME")
+            box.operator("video_mocap.stop_pipeline", icon="CANCEL", text="Stop Pipeline")
+        else:
+            if props.pipeline_status:
+                err = "error" in props.pipeline_status.lower()
+                ok = "complete" in props.pipeline_status.lower()
+                icon = "ERROR" if err else ("CHECKMARK" if ok else "INFO")
+                box.label(text=props.pipeline_status, icon=icon)
+            box.operator("video_mocap.run_pipeline", icon="PLAY",
+                         text="Run Pipeline (auto)")
 
         # Estimator info
         layout.separator()
         info = layout.box()
-        info.label(text="Estimator: 4D-Humans / HMR2 (SMPL)", icon="ARMATURE_DATA")
-        info.label(text="Env: ~/hmr2_env (macOS Apple Silicon OK)")
-        info.label(text="Output: .npz with 24-joint rotations")
+        info.label(text="Primary: MediaPipe IK  (~/mp_env)", icon="ARMATURE_DATA")
+        info.label(text="Fallback: HMR2  (~/hmr2_env, MPS)")
+        info.label(text="Output: .npz — 24 joints, axis-angle")
 
 
 # ------------------------------------------------------------------
@@ -703,6 +1170,9 @@ class VMMCP_PT_panel(Panel):
 classes = (
     VMMCP_Props,
     VMMCP_OT_generate,
+    VMMCP_OT_generate_steps,
+    VMMCP_OT_run_pipeline,
+    VMMCP_OT_stop_pipeline,
     VMMCP_PT_panel,
 )
 
