@@ -311,10 +311,23 @@ _pipe_lock = threading.Lock()
 
 
 def _claude_exe():
-    exe = shutil.which("claude")
-    if exe is None:
-        raise RuntimeError("'claude' not found in PATH — install Claude Code CLI.")
-    return exe
+    # Blender's PATH is restricted — check common locations explicitly
+    candidates = [
+        shutil.which("claude"),
+        os.path.expanduser("~/.nvm/versions/node/v24.14.1/bin/claude"),
+        "/usr/local/bin/claude",
+        "/opt/homebrew/bin/claude",
+    ]
+    # Also check all node versions in nvm
+    nvm_dir = os.path.expanduser("~/.nvm/versions/node")
+    if os.path.isdir(nvm_dir):
+        for v in sorted(os.listdir(nvm_dir), reverse=True):
+            candidates.append(os.path.join(nvm_dir, v, "bin", "claude"))
+
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    raise RuntimeError("'claude' not found — install Claude Code CLI.")
 
 
 def _run_one_step(marker, label, full_prompt):
