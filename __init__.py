@@ -254,16 +254,12 @@ def _validate_scene(context, props):
 # Pipeline — file-based, timer-driven, single path of execution
 # ------------------------------------------------------------------
 
-# Pipeline state — accessed ONLY from Blender main thread (timer + operators)
-# No threading, no lock needed.
+# Pipeline state — for UI status tracking only
 _pipe = {
     "running": False,
-    "step_idx": 0,        # index of the NEXT step to send
-    "steps": [],          # list of (marker, label, step_text)
-    "context_text": "",   # shared context prepended to each step
+    "total_steps": 0,
+    "markers": [],        # list of marker strings to watch
     "scene_name": "",
-    "last_sent_marker": "",  # marker of the step currently running in Claude
-    "last_activity": 0.0,    # time.time() of last marker change (for stall detection)
 }
 
 
@@ -282,64 +278,17 @@ def _debug_log(msg):
     line = f"[{ts}] {msg}\n"
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(line)
-    print(f"[VMMCP] {line.strip()}")  # also print to Blender console
+    print(f"[VMMCP] {line.strip()}")
 
 
 def _clear_steps_dir():
     d = _steps_dir()
     for f in os.listdir(d):
-        # Keep .mcp.json and .claude/ and CLAUDE.md
-        if f in (".mcp.json", ".claude", "CLAUDE.md"):
+        if f in (".mcp.json", ".claude"):
             continue
         fp = os.path.join(d, f)
         if os.path.isfile(fp):
             os.unlink(fp)
-
-
-def _write_claude_md(steps_dir):
-    """Write CLAUDE.md that tells Claude to auto-chain steps."""
-    path = os.path.join(steps_dir, "CLAUDE.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(
-            "# VMMCP Pipeline Instructions\n\n"
-            "You are running a step-by-step motion capture pipeline.\n\n"
-            "AFTER completing each step:\n"
-            "1. Create the signal file as instructed at the end of the step\n"
-            "2. Wait 5 seconds\n"
-            "3. Check if a file called NEXT_STEP.md exists in this directory\n"
-            "4. If it exists, read it and execute the step it points to\n"
-            "5. If it does not exist yet, wait 5 more seconds and check again\n"
-            "6. Repeat until NEXT_STEP.md appears or says PIPELINE_DONE\n\n"
-            "IMPORTANT: After EACH step, you MUST check for NEXT_STEP.md.\n"
-            "Do NOT stop after one step. The pipeline has multiple steps.\n"
-        )
-    return path
-
-
-def _write_next_step(steps_dir, step_path):
-    """Write NEXT_STEP.md pointing to the next step file."""
-    path = os.path.join(steps_dir, "NEXT_STEP.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"Read and execute the prompt in {step_path}\n")
-    return path
-
-
-def _write_pipeline_done(steps_dir):
-    """Write NEXT_STEP.md with completion signal."""
-    path = os.path.join(steps_dir, "NEXT_STEP.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("PIPELINE_DONE\n\nAll steps have been completed. Good job!\n")
-    return path
-
-
-def _write_step_file(step_idx, marker, label, full_prompt):
-    d = _steps_dir()
-    filename = f"step_{step_idx:02d}_{marker.replace('_OK', '')}.md"
-    path = os.path.join(d, filename)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"# {label}\n\n")
-        f.write(full_prompt)
-    return path
 
 
 def _find_claude_cli():
@@ -369,113 +318,79 @@ def _ensure_mcp_config(target_dir):
         json.dump(config, f, indent=2)
 
 
-def _launch_claude_terminal(work_dir, first_msg):
-    """Open a new terminal with claude CLI. Non-blocking."""
+def _launch_claude_terminal(work_dir, prompt_file):
+    """Open a new terminal with claude CLI reading the pipeline file."""
     import sys
     claude_path = _find_claude_cli()
     if not claude_path:
         raise RuntimeError("'claude' CLI not found.")
     _ensure_mcp_config(work_dir)
 
-    # Escape single quotes in paths
-    wd = work_dir.replace("'", "'\\''")
-    cp = claude_path.replace("'", "'\\''")
-    msg = first_msg.replace("'", "'\\''").replace('"', '\\"')
+    msg = f"Read the file {prompt_file} and execute ALL steps in order. After each step, create the signal file as instructed. Do NOT stop between steps."
 
     if sys.platform == "darwin":
+        wd = work_dir.replace('"', '\\\\"')
+        cp = claude_path.replace('"', '\\\\"')
+        escaped_msg = msg.replace('"', '\\\\"')
         script = (
             'tell application "Terminal"\n'
             '    activate\n'
-            f'    do script "cd \\"{wd}\\" && \\"{cp}\\" \\"{msg}\\""\n'
+            f'    do script "cd \\"{wd}\\" && \\"{cp}\\" \\"{escaped_msg}\\""\n'
             'end tell'
         )
         subprocess.Popen(["osascript", "-e", script])
     elif sys.platform == "win32":
         subprocess.Popen(
-            f'start cmd /k "cd /d "{work_dir}" && "{claude_path}" "{first_msg}""',
+            f'start cmd /k "cd /d "{work_dir}" && "{claude_path}" "{msg}""',
             shell=True,
         )
     else:
         subprocess.Popen([
             "x-terminal-emulator", "-e",
-            f'bash -c \'cd "{work_dir}" && "{claude_path}" "{first_msg}"\'',
+            f'bash -c \'cd "{work_dir}" && "{claude_path}" "{msg}"\'',
         ])
 
 
 
 def _pipeline_tick():
-    """Blender timer — polls marker every 3 seconds, auto-advances steps."""
+    """Blender timer — tracks progress by checking .done files.
+    Claude handles step execution itself from the single .md file.
+    This timer only updates the UI status.
+    """
     if not _pipe["running"]:
-        _debug_log("TICK: pipeline not running, stopping timer")
         return None
 
     scene = bpy.data.scenes.get(_pipe["scene_name"])
     if scene is None:
-        _debug_log(f"TICK: scene '{_pipe['scene_name']}' not found, stopping")
         _pipe["running"] = False
         return None
 
     props = scene.vmmcp
-    steps = _pipe["steps"]
-    idx = _pipe["step_idx"]
+    markers = _pipe["markers"]
+    steps_d = _steps_dir()
 
-    done_check = ""
-    if _pipe["last_sent_marker"]:
-        done_check = os.path.join(_steps_dir(), f"{_pipe['last_sent_marker']}.done")
-    _debug_log(f"TICK: idx={idx}, total={len(steps)}, "
-               f"marker='{_pipe['last_sent_marker']}', "
-               f"done_file_exists={os.path.isfile(done_check) if done_check else 'N/A'}")
-
-    # All steps sent and confirmed?
-    if idx > len(steps):
-        _debug_log("TICK: all steps done, stopping")
-        _pipe["running"] = False
-        props.pipeline_status = f"Pipeline complete — {len(steps)} steps done!"
-        return None
-
-    # Waiting for the current step to finish?
-    if _pipe["last_sent_marker"]:
-        done_file = os.path.join(_steps_dir(), f"{_pipe['last_sent_marker']}.done")
-        if not os.path.isfile(done_file):
-            elapsed = time.time() - _pipe["last_activity"]
-            _debug_log(f"TICK: waiting for file '{done_file}', elapsed={elapsed:.0f}s")
-            props.pipeline_status = (
-                f"Step {idx}/{len(steps)} — waiting for Claude "
-                f"({elapsed:.0f}s)"
-            )
-            return 3.0
+    # Count completed steps
+    completed = 0
+    current_label = ""
+    for marker in markers:
+        done_file = os.path.join(steps_d, f"{marker}.done")
+        if os.path.isfile(done_file):
+            completed += 1
         else:
-            _debug_log(f"TICK: signal file found! '{_pipe['last_sent_marker']}' CONFIRMED!")
-            _pipe["last_activity"] = time.time()
-            _pipe["last_sent_marker"] = ""
+            current_label = marker
+            break
 
-    # Are there more steps?
-    if idx >= len(steps):
-        _debug_log("TICK: no more steps, completing")
-        _write_pipeline_done(_steps_dir())
-        _pipe["step_idx"] = idx + 1
+    total = len(markers)
+    _debug_log(f"TICK: {completed}/{total} done, waiting='{current_label}'")
+
+    if completed >= total:
         _pipe["running"] = False
-        props.pipeline_status = f"Pipeline complete — {len(steps)} steps done!"
+        props.pipeline_status = f"Pipeline complete — {total} steps done!"
+        _debug_log("TICK: ALL STEPS COMPLETE")
         return None
 
-    # --- WRITE NEXT STEP FILE ---
-    marker, label, step_text = steps[idx]
-    full_prompt = _pipe["context_text"] + "\n\n" + step_text
-
-    step_path = _write_step_file(idx, marker, label, full_prompt)
-    _debug_log(f"TICK: wrote step file {step_path}")
-
-    # Write NEXT_STEP.md so Claude picks it up
-    _write_next_step(_steps_dir(), step_path)
-    _debug_log(f"TICK: wrote NEXT_STEP.md -> {step_path}")
-
-    _pipe["step_idx"] = idx + 1
-    _pipe["last_sent_marker"] = marker
-    _pipe["last_activity"] = time.time()
-    props.pipeline_status = f"Step {idx + 1}/{len(steps)}: {label} — running..."
-    _debug_log(f"TICK: step {idx + 1} '{label}' ready, waiting for '{marker}'")
-
-    return 3.0
+    props.pipeline_status = f"Step {completed + 1}/{total} running..."
+    return 5.0
 
 
 # ------------------------------------------------------------------
@@ -536,24 +451,17 @@ def _build_steps(videos, props):
     single_file_mode = "_single_file" in videos
     layout = videos.get("_layout", "AUTO") if single_file_mode else "N/A"
 
-    steps_dir = _steps_dir()
+    sd = _steps_dir()
 
     def wrap(marker, label, body):
-        done_file = os.path.join(steps_dir, f"{marker}.done")
-        next_step_file = os.path.join(steps_dir, "NEXT_STEP.md")
+        done_file = os.path.join(sd, f"{marker}.done")
         return (marker, label,
-            f"=== {label} ===\n"
-            "Execute ONLY this step.\n\n"
+            f"\n---\n\n## {label}\n\n"
             + body +
-            f"\nWhen this step is FULLY COMPLETE, do these 3 things IN ORDER:\n"
-            f"  1. Create the signal file: write 'done' to {done_file}\n"
-            f"  2. Wait 5 seconds (the addon needs time to write the next step)\n"
-            f"  3. Read the file {next_step_file} — it contains the path to "
-            f"the next step. Execute that step.\n"
-            f"     If it says PIPELINE_DONE, stop.\n"
-            f"     If the file does not exist yet, wait 5 more seconds and retry.\n"
-            f"\nDo NOT create the signal file until the step is truly finished.\n"
-            f"Do NOT stop after this step — always check NEXT_STEP.md.\n"
+            f"\nWhen this step is FULLY COMPLETE, create the signal file:\n"
+            f"  echo done > '{done_file}'\n"
+            f"Do NOT create it until the step is truly finished.\n"
+            f"Then move on to the next step below.\n"
         )
 
     steps = []
@@ -689,10 +597,17 @@ def _build_steps(videos, props):
 def _build_prompt(context, mesh, cameras, videos, props):
     ctx = _build_context(context, mesh, cameras, videos, props)
     steps = _build_steps(videos, props)
-    full = ctx + "\n\n"
+    full = (
+        "# VMMCP Motion Capture Pipeline\n\n"
+        "Execute ALL steps below IN ORDER. Do NOT skip any step.\n"
+        "After each step, create the signal file as instructed.\n"
+        "Then move on to the next step immediately.\n\n"
+        + ctx + "\n\n"
+    )
     for _m, _l, step_text in steps:
-        full += step_text + "\n\n"
-    return full
+        full += step_text + "\n"
+    full += "\n---\n\n## Pipeline Complete\n\nAll steps done. Good job!\n"
+    return full, [m for m, _l, _t in steps]
 
 
 # ------------------------------------------------------------------
@@ -712,7 +627,7 @@ class VMMCP_OT_generate(Operator):
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         cameras = _setup_cameras(context, mesh, props)
-        prompt = _build_prompt(context, mesh, cameras, videos, props)
+        prompt, _markers = _build_prompt(context, mesh, cameras, videos, props)
         _write_text("VMMCP_Prompt", prompt)
         context.window_manager.clipboard = prompt
         _export_txt(prompt, bpy.data.filepath)
@@ -740,50 +655,46 @@ class VMMCP_OT_launch(Operator):
             return {"CANCELLED"}
 
         cameras = _setup_cameras(context, mesh, props)
-        ctx_text = _build_context(context, mesh, cameras, videos, props)
-        steps = _build_steps(videos, props)
+        prompt, markers = _build_prompt(context, mesh, cameras, videos, props)
 
-        # Clear old files and write CLAUDE.md
+        # Clear old files
         _clear_steps_dir()
         steps_dir = _steps_dir()
-        _write_claude_md(steps_dir)
 
-        # Write first step
-        marker, label, step_text = steps[0]
-        first_path = _write_step_file(0, marker, label, ctx_text + "\n\n" + step_text)
+        # Write the single pipeline file
+        pipeline_file = os.path.join(steps_dir, "PIPELINE.md")
+        with open(pipeline_file, "w", encoding="utf-8") as f:
+            f.write(prompt)
 
-        # Init pipeline state
+        # Also save to clipboard and text block
+        _write_text("VMMCP_Prompt", prompt)
+        context.window_manager.clipboard = prompt
+
+        # Init pipeline state for UI tracking
         _pipe["running"] = True
-        _pipe["step_idx"] = 1       # step 0 already sent
-        _pipe["steps"] = steps
-        _pipe["context_text"] = ctx_text
+        _pipe["total_steps"] = len(markers)
+        _pipe["markers"] = markers
         _pipe["scene_name"] = context.scene.name
-        _pipe["last_sent_marker"] = marker
-        _pipe["last_activity"] = time.time()
 
-        props.pipeline_status = f"Step 1/{len(steps)}: {label} — launching Claude..."
+        _debug_log(f"LAUNCH: pipeline_file={pipeline_file}")
+        _debug_log(f"LAUNCH: {len(markers)} steps: {markers}")
 
-        # Launch terminal
-        first_msg = f"Read and execute the prompt in {first_path}"
-        _debug_log(f"LAUNCH: steps_dir={steps_dir}")
-        _debug_log(f"LAUNCH: first_path={first_path}")
-        _debug_log(f"LAUNCH: first_msg={first_msg}")
-        _debug_log(f"LAUNCH: steps count={len(steps)}")
-        _debug_log(f"LAUNCH: markers={[s[0] for s in steps]}")
+        props.pipeline_status = f"Launching Claude — {len(markers)} steps..."
+
+        # Launch terminal with the single file
         try:
-            _launch_claude_terminal(steps_dir, first_msg)
+            _launch_claude_terminal(steps_dir, pipeline_file)
             _debug_log("LAUNCH: terminal opened OK")
         except Exception as exc:
             _debug_log(f"LAUNCH: terminal FAILED: {exc}")
-            context.window_manager.clipboard = first_msg
-            props.pipeline_status = f"Terminal failed — paste clipboard in Claude Code"
-            self.report({"WARNING"}, f"Terminal failed ({exc}), instruction in clipboard")
+            props.pipeline_status = "Terminal failed — paste clipboard in Claude Code"
+            self.report({"WARNING"}, f"Terminal failed ({exc}), prompt in clipboard")
 
-        # Start timer
+        # Start UI tracking timer
         if not bpy.app.timers.is_registered(_pipeline_tick):
-            bpy.app.timers.register(_pipeline_tick, first_interval=8.0)
+            bpy.app.timers.register(_pipeline_tick, first_interval=10.0)
 
-        self.report({"INFO"}, f"Pipeline launched — {len(steps)} steps")
+        self.report({"INFO"}, f"Pipeline launched — {len(markers)} steps")
         return {"FINISHED"}
 
 
@@ -808,10 +719,8 @@ class VMMCP_OT_reset(Operator):
     def execute(self, context):
         props = context.scene.vmmcp
         _pipe["running"] = False
-        _pipe["step_idx"] = 0
-        _pipe["steps"] = []
-        _pipe["context_text"] = ""
-        _pipe["last_sent_marker"] = ""
+        _pipe["total_steps"] = 0
+        _pipe["markers"] = []
         props.pipeline_status = ""
 
         mesh_obj = bpy.data.objects.get(props.mesh_object)
