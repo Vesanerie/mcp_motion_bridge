@@ -432,62 +432,85 @@ def _launch_claude_terminal(steps_dir, first_step_path):
         )
 
 
-def _run_one_step(marker, label, full_prompt):
-    """Write step prompt to .md file."""
-    with _pipe_lock:
-        idx = _pipe["step_idx"]
-        path = _write_step_file(idx, marker, label, full_prompt)
-        _write_current_step_pointer(idx, path)
-        _pipe["status"] = f"{label} — written to {os.path.basename(path)}"
+def _send_step_to_terminal(step_path):
+    """Send a 'read next step' message to the existing Claude terminal."""
+    import sys
+    msg = f"Read and execute the prompt in {step_path}"
+
+    if sys.platform == "darwin":
+        # Send keystroke to the frontmost Terminal window
+        script = f'''
+        tell application "Terminal"
+            activate
+            delay 0.3
+            tell application "System Events"
+                tell process "Terminal"
+                    keystroke "{msg}"
+                    delay 0.2
+                    keystroke return
+                end tell
+            end tell
+        end tell
+        '''
+        subprocess.Popen(["osascript", "-e", script])
+
+    elif sys.platform == "win32":
+        # Use PowerShell to send keys to the cmd window running claude
+        ps = f'''
+        Add-Type -AssemblyName System.Windows.Forms
+        $wshell = New-Object -ComObject wscript.shell
+        $wshell.AppActivate("claude")
+        Start-Sleep -Milliseconds 300
+        [System.Windows.Forms.SendKeys]::SendWait("{msg}{{ENTER}}")
+        '''
+        subprocess.Popen(["powershell", "-NoProfile", "-Command", ps])
 
 
 def _pipeline_tick():
-    """bpy.app.timers callback — sends one step, then stops.
-    User clicks 'Next Step' to send the next one (Claude needs time to execute)."""
-    with _pipe_lock:
-        if not _pipe["running"]:
-            _sync_status_to_scene()
-            return None
-
-        if _pipe["error"]:
-            _sync_status_to_scene()
-            _pipe["running"] = False
-            return None
-
-        thread = _pipe["thread"]
-        if thread is not None and thread.is_alive():
-            _sync_status_to_scene()
-            return 1.0
-
-        # Thread finished — mark step as sent, pause for user
-        idx = _pipe["step_idx"]
-        steps = _pipe["steps"]
-
-        if idx >= len(steps):
-            _pipe["running"] = False
-            _pipe["status"] = f"All {len(steps)} steps sent to Claude Code!"
-            _sync_status_to_scene(finished=True)
-            return None
-
-        # Step was just sent — pause pipeline, wait for user to click Next
-        _pipe["running"] = False
-        _pipe["status"] = f"Step {idx}/{len(steps)} sent — click 'Next Step' when Claude is done"
-        _sync_status_to_scene()
-    return None
-
-
-def _sync_status_to_scene(finished=False):
-    """Write _pipe status into the Blender scene property (called from main thread)."""
+    """bpy.app.timers callback — polls the scene marker every 2 seconds.
+    When Claude sets the marker, automatically sends the next step."""
     scene = bpy.data.scenes.get(_pipe.get("scene_name", ""))
-    if scene is None:
-        return
+    if scene is None or not _pipe["running"]:
+        return None
+
     props = scene.vmmcp
-    if _pipe["error"]:
-        props.pipeline_status = f"ERROR: {_pipe['error']}"
+    steps = _pipe["steps"]
+    idx = _pipe["step_idx"]
+
+    if idx >= len(steps):
+        _pipe["running"] = False
+        props.pipeline_status = f"Pipeline complete — {len(steps)} steps done!"
         props.pipeline_running = False
-    else:
-        props.pipeline_status = _pipe["status"]
-        props.pipeline_running = not finished and _pipe["running"]
+        return None
+
+    # Check if the PREVIOUS step's marker has been set by Claude
+    if idx > 0:
+        prev_marker = steps[idx - 1][0]
+        scene_marker = scene.get("vmmcp_step_done", "")
+        if scene_marker != prev_marker:
+            # Still waiting for Claude to finish
+            props.pipeline_status = f"Step {idx}/{len(steps)} — waiting for Claude..."
+            return 2.0  # poll again in 2 seconds
+
+    # Previous step done (or first step) — send next step
+    marker, label, step_text = steps[idx]
+    full_prompt = _pipe["history"] + "\n\n" + step_text
+
+    # Write step file
+    step_path = _write_step_file(idx, marker, label, full_prompt)
+    _write_current_step_pointer(idx, step_path)
+
+    # Clear marker for this new step
+    scene["vmmcp_step_done"] = ""
+
+    # Send to Claude terminal
+    _send_step_to_terminal(step_path)
+
+    _pipe["step_idx"] = idx + 1
+    props.pipeline_status = f"Step {idx + 1}/{len(steps)}: {label} — running..."
+    props.pipeline_running = True
+
+    return 2.0  # keep polling
 
 
 # ------------------------------------------------------------------
@@ -1121,36 +1144,34 @@ class VMMCP_OT_run_pipeline(Operator):
             _pipe["thread"] = None
             _pipe["scene_name"] = context.scene.name
 
-        # Clear old step files and marker
+        # Clear old step files
         _clear_steps_dir()
         context.scene["vmmcp_step_done"] = ""
-
-        # Write ALL step files at once
-        steps = _pipe["steps"]
         steps_dir = _steps_dir()
-        for i, (marker, label, step_text) in enumerate(steps):
-            full_prompt = _pipe["history"] + "\n\n" + step_text
-            _write_step_file(i, marker, label, full_prompt)
 
-        # Point to step 0
+        # Write first step file
+        steps = _pipe["steps"]
         marker, label, step_text = steps[0]
         first_path = _write_step_file(0, marker, label, _pipe["history"] + "\n\n" + step_text)
         _write_current_step_pointer(0, first_path)
 
         _pipe["step_idx"] = 1
-        props.pipeline_running = len(steps) > 1
+        _pipe["running"] = True
+        props.pipeline_running = True
 
-        # Launch a fresh Claude Code terminal session
+        # Launch Claude Code terminal with first step
         try:
             _launch_claude_terminal(steps_dir, first_path)
             props.pipeline_status = f"Step 1/{len(steps)}: {label} — Claude Code launched"
-            self.report({"INFO"}, f"Claude Code terminal opened with {len(steps)} steps")
+            self.report({"INFO"}, f"Claude Code opened — {len(steps)} steps, fully automatic")
         except Exception as exc:
-            # Fallback: copy to clipboard if terminal launch fails
-            instruction = f"Read and execute the step in {first_path}"
-            context.window_manager.clipboard = instruction
-            props.pipeline_status = f"Step 1/{len(steps)}: {label} — paste clipboard in Claude Code"
-            self.report({"WARNING"}, f"Terminal launch failed ({exc}), instruction copied to clipboard")
+            context.window_manager.clipboard = f"Read and execute the prompt in {first_path}"
+            props.pipeline_status = f"Terminal failed — paste clipboard in Claude Code"
+            self.report({"WARNING"}, f"Terminal failed ({exc}), instruction in clipboard")
+
+        # Start the auto-advance timer
+        if not bpy.app.timers.is_registered(_pipeline_tick):
+            bpy.app.timers.register(_pipeline_tick, first_interval=5.0)
 
         return {"FINISHED"}
 
@@ -1331,53 +1352,25 @@ class VMMCP_PT_panel(Panel):
 
         layout.separator()
 
-        # Manual mode
-        box = layout.box()
-        box.label(text="Manual Mode", icon="COPYDOWN")
-        box.operator("video_mocap.generate", icon="COPYDOWN", text="Generate Prompt")
-        box.label(text="Paste in Claude Code + BlenderMCP", icon="INFO")
-        box.operator("video_mocap.generate_steps", icon="FILE_TEXT",
-                     text="Generate Step Files Only")
-
-        layout.separator()
-
-        # Pipeline — file-based steps
+        # Pipeline
         box = layout.box()
         box.label(text="Pipeline", icon="PLAY")
 
-        steps = _pipe.get("steps", [])
-        idx = _pipe.get("step_idx", 0)
-
         if props.pipeline_status:
             err = "error" in props.pipeline_status.lower()
-            done = "all" in props.pipeline_status.lower() and "done" in props.pipeline_status.lower()
-            icon = "ERROR" if err else ("CHECKMARK" if done else "INFO")
+            done = "complete" in props.pipeline_status.lower()
+            icon = "ERROR" if err else ("CHECKMARK" if done else "TIME")
             box.label(text=props.pipeline_status, icon=icon)
 
-        if steps and idx > 0 and idx <= len(steps):
-            prev_marker = steps[idx - 1][0]
-            scene_marker = context.scene.get("vmmcp_step_done", "")
-            if scene_marker == prev_marker:
-                box.label(text="Claude finished — ready for next step", icon="CHECKMARK")
-            else:
-                box.label(text="Waiting for Claude to finish...", icon="TIME")
-
-        if not steps or idx >= len(steps):
+        if props.pipeline_running:
+            box.operator("video_mocap.stop_pipeline", icon="CANCEL", text="Stop")
+        else:
             box.operator("video_mocap.run_pipeline", icon="PLAY",
-                         text="Generate Steps")
-        if props.pipeline_running and idx < len(steps):
-            row = box.row()
-            row.enabled = VMMCP_OT_next_step.poll(context)
-            row.operator("video_mocap.next_step", icon="FORWARD",
-                         text=f"Next Step ({idx + 1}/{len(steps)}) →")
+                         text="Launch Pipeline")
 
-        # Show steps folder path
-        if steps:
-            box.label(text=f"Steps folder: VMMCP_Steps/", icon="FILE_FOLDER")
-            box.label(text="Paste clipboard in Claude Code", icon="INFO")
-            box.separator()
-            box.operator("video_mocap.reset_pipeline", icon="FILE_REFRESH",
-                         text="Reset (back to Step 0)")
+        box.separator()
+        box.operator("video_mocap.generate", icon="COPYDOWN", text="Copy Prompt Only")
+        box.operator("video_mocap.reset_pipeline", icon="FILE_REFRESH", text="Reset")
 
         # Estimator info
         layout.separator()
