@@ -433,20 +433,25 @@ def _launch_claude_terminal(steps_dir, first_step_path):
 
 
 def _send_step_to_terminal(step_path):
-    """Send a 'read next step' message to the existing Claude terminal."""
+    """Send the next step instruction to the Claude terminal via clipboard paste.
+    More reliable than keystroke for long paths.
+    """
     import sys
     msg = f"Read and execute the prompt in {step_path}"
 
     if sys.platform == "darwin":
-        # Send keystroke to the frontmost Terminal window
-        script = f'''
+        # Copy to clipboard first, then paste into Terminal
+        subprocess.run(["pbcopy"], input=msg.encode("utf-8"), check=True)
+        script = '''
         tell application "Terminal"
             activate
-            delay 0.3
+            delay 0.5
             tell application "System Events"
                 tell process "Terminal"
-                    keystroke "{msg}"
-                    delay 0.2
+                    set frontmost to true
+                    delay 0.3
+                    keystroke "v" using command down
+                    delay 0.3
                     keystroke return
                 end tell
             end tell
@@ -455,14 +460,17 @@ def _send_step_to_terminal(step_path):
         subprocess.Popen(["osascript", "-e", script])
 
     elif sys.platform == "win32":
-        # Use PowerShell to send keys to the cmd window running claude
         ps = f'''
-        Add-Type -AssemblyName System.Windows.Forms
-        $wshell = New-Object -ComObject wscript.shell
-        $wshell.AppActivate("claude")
-        Start-Sleep -Milliseconds 300
-        [System.Windows.Forms.SendKeys]::SendWait("{msg}{{ENTER}}")
-        '''
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Clipboard]::SetText("{msg}")
+Start-Sleep -Milliseconds 200
+$wshell = New-Object -ComObject wscript.shell
+$wshell.AppActivate("claude")
+Start-Sleep -Milliseconds 500
+[System.Windows.Forms.SendKeys]::SendWait("^v")
+Start-Sleep -Milliseconds 300
+[System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
+'''
         subprocess.Popen(["powershell", "-NoProfile", "-Command", ps])
 
 
