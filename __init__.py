@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Video Mocap MCP",
     "author": "You",
-    "version": (0, 2, 2),
+    "version": (0, 2, 3),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Mocap",
     "description": "Prepare mesh rigging and animation requests for Claude via BlenderMCP.",
@@ -10,6 +10,7 @@ bl_info = {
 
 import json
 import os
+import uuid
 
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
@@ -131,6 +132,8 @@ def _target_mesh(context, props):
         props.mesh_object = obj.name
     if obj is None or obj.type != "MESH":
         return None
+    if not obj.get("vmmcp_target_id"):
+        obj["vmmcp_target_id"] = str(uuid.uuid4())
     return obj
 
 
@@ -210,13 +213,26 @@ def _mesh_summary(obj):
     mesh = obj.data
     center, min_v, max_v, size, _radius = _world_bbox(obj)
     modifiers = [{"name": m.name, "type": m.type, "show_viewport": m.show_viewport} for m in obj.modifiers]
+    armature_modifiers = [
+        {
+            "name": m.name,
+            "object": m.object.name if getattr(m, "object", None) else "",
+            "show_viewport": m.show_viewport,
+        }
+        for m in obj.modifiers
+        if m.type == "ARMATURE"
+    ]
     materials = [slot.material.name for slot in obj.material_slots if slot.material]
+    vertex_groups = [group.name for group in obj.vertex_groups]
     shape_keys = []
     if mesh.shape_keys:
         shape_keys = [key.name for key in mesh.shape_keys.key_blocks]
+    parent = obj.parent.name if obj.parent else ""
+    children = [child.name for child in obj.children]
 
     return {
         "name": obj.name,
+        "target_id": obj.get("vmmcp_target_id", ""),
         "data_name": mesh.name,
         "vertex_count": len(mesh.vertices),
         "edge_count": len(mesh.edges),
@@ -224,11 +240,16 @@ def _mesh_summary(obj):
         "world_location": list(obj.location),
         "world_rotation_euler": list(obj.rotation_euler),
         "world_scale": list(obj.scale),
+        "dimensions": list(obj.dimensions),
         "bbox_min": list(min_v),
         "bbox_max": list(max_v),
         "bbox_size": list(size),
         "bbox_center": list(center),
+        "parent": parent,
+        "children": children,
         "modifiers": modifiers,
+        "armature_modifiers": armature_modifiers,
+        "vertex_groups": vertex_groups,
         "materials": materials,
         "shape_keys": shape_keys,
     }
@@ -307,6 +328,12 @@ def _base_payload(context, mesh, props, cameras):
         "addon": "video_mocap_mcp",
         "blend_file": bpy.data.filepath,
         "scene": context.scene.name,
+        "target_contract": {
+            "mesh_object_name": mesh.name,
+            "mesh_data_name": mesh.data.name,
+            "mesh_target_id": mesh.get("vmmcp_target_id", ""),
+            "rule": "Only this mesh is the animation target. Do not rig, bind, retarget or animate any other mesh unless the user explicitly changes mesh_object.",
+        },
         "mesh": _mesh_summary(mesh),
         "camera_setup": cameras,
         "camera_policy": {
@@ -320,6 +347,10 @@ def _base_payload(context, mesh, props, cameras):
             "start": props.frame_start,
             "end": props.frame_end,
             "fps": context.scene.render.fps / context.scene.render.fps_base,
+        },
+        "documentation_policy": {
+            "readme_must_be_updated_with_behavior_changes": True,
+            "readme_path": "README.md",
         },
     }
 
@@ -358,6 +389,9 @@ def _request_text(kind, payload):
         "===================================\n\n"
         f"Task: {task}\n\n"
         "Important constraints:\n"
+        "- First confirm the target mesh by exact object name and vmmcp_target_id from target_contract.\n"
+        "- Rig, bind, retarget and animate only the target mesh from target_contract.\n"
+        "- If multiple meshes exist, ignore all non-target meshes unless they are explicitly required as references.\n"
         "- Do not generate a separate MediaPipe skeleton.\n"
         "- The final animation must be applied to the mesh rig bones.\n"
         "- Follow the rig_settings payload for target platform and bone count.\n"
@@ -386,6 +420,11 @@ def _request_text(kind, payload):
         "- If a pose matches one angle but contradicts another available angle, "
         "adjust the rig until the pose is coherent across the reference views.\n"
         "- Do this comparison before considering the rigging or animation pass done.\n\n"
+        "Mesh adaptation requirement:\n"
+        "- Fit the armature to the target mesh proportions before applying animation.\n"
+        "- Keep bone lengths coherent with the target mesh anatomy, not with a generic template.\n"
+        "- Verify deformation on the target mesh after binding: shoulders, hips, elbows, knees, wrists, ankles and root motion must follow the mesh volume without dislocation.\n"
+        "- If existing armature modifiers or vertex groups are present on the target mesh, inspect them before creating replacements.\n\n"
         "Payload JSON:\n"
         f"{json.dumps(payload, indent=2)}\n"
     )
