@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Video Mocap MCP",
     "author": "You",
-    "version": (0, 7, 0),
+    "version": (0, 8, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Mocap",
     "description": "Prepare motion capture context for Claude Code via BlenderMCP.",
@@ -12,7 +12,7 @@ import json
 import os
 
 import bpy
-from bpy.props import FloatProperty, IntProperty, StringProperty
+from bpy.props import EnumProperty, FloatProperty, IntProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Vector
 
@@ -31,10 +31,33 @@ CAMERA_SPECS = (
 # Properties — only what the user needs to fill
 # ------------------------------------------------------------------
 class VMMCP_Props(PropertyGroup):
+    mesh_source: EnumProperty(
+        name="Mesh Source",
+        items=[
+            ("SCENE", "Scene Mesh", "Use a mesh already in the Blender scene"),
+            ("SMPL", "SMPL Body", "Import a SMPL base mesh as the target"),
+        ],
+        default="SCENE",
+    )
     mesh_object: StringProperty(
         name="Mesh",
         description="Mesh object to rig and animate (auto-detected if selected)",
         default="",
+    )
+    smpl_model_path: StringProperty(
+        name="SMPL Model",
+        description="Path to SMPL model file (.pkl) or exported mesh (.obj / .npz)",
+        subtype="FILE_PATH",
+        default="",
+    )
+    smpl_gender: EnumProperty(
+        name="Gender",
+        items=[
+            ("neutral", "Neutral", ""),
+            ("male", "Male", ""),
+            ("female", "Female", ""),
+        ],
+        default="neutral",
     )
     front_video: StringProperty(name="Front", subtype="FILE_PATH", default="")
     back_video: StringProperty(name="Back", subtype="FILE_PATH", default="")
@@ -48,6 +71,16 @@ class VMMCP_Props(PropertyGroup):
     )
     frame_start: IntProperty(name="Start", default=1, min=1)
     frame_end: IntProperty(name="End", default=250, min=1)
+    user_camera: StringProperty(
+        name="Protected Camera",
+        description="This camera will never be deleted (your render/hero camera)",
+        default="",
+    )
+    cleanup_cameras: bpy.props.BoolProperty(
+        name="Delete Other Cameras",
+        description="Delete all cameras that are not VMMCP analysis cameras and not the protected camera",
+        default=False,
+    )
 
 
 # ------------------------------------------------------------------
@@ -87,6 +120,19 @@ def _look_at(obj, target):
 def _setup_cameras(context, mesh, props):
     center, _min_v, _max_v, _size, radius = _world_bbox(mesh)
     distance = radius * props.camera_distance
+
+    if props.cleanup_cameras:
+        vmmcp_names = {f"VMMCP_{v.upper()}_Camera" for v, _ in CAMERA_SPECS}
+        protected = props.user_camera.strip()
+        to_delete = [
+            obj for obj in list(context.scene.objects)
+            if obj.type == "CAMERA"
+            and obj.name not in vmmcp_names
+            and obj.name != protected
+        ]
+        for obj in to_delete:
+            bpy.data.objects.remove(obj, do_unlink=True)
+
     cameras = {}
     for view_name, axis in CAMERA_SPECS:
         cam_name = f"VMMCP_{view_name.upper()}_Camera"
@@ -141,6 +187,55 @@ def _video_sources(props):
     return {k: v for k, v in sources.items() if v and os.path.isfile(v)}
 
 
+def _import_smpl_mesh(context, model_path, gender):
+    """Import SMPL base mesh from a .pkl, .obj, or .npz file."""
+    obj_name = f"SMPL_{gender.upper()}"
+
+    existing = bpy.data.objects.get(obj_name)
+    if existing and existing.type == "MESH":
+        return existing
+
+    ext = os.path.splitext(model_path)[1].lower()
+
+    if ext == ".obj":
+        try:
+            bpy.ops.wm.obj_import(filepath=model_path)
+        except AttributeError:
+            bpy.ops.import_scene.obj(filepath=model_path)
+        imported = next((o for o in context.selected_objects if o.type == "MESH"), None)
+        if imported:
+            imported.name = obj_name
+        return imported
+
+    if ext == ".pkl":
+        import pickle
+        import numpy as np
+        with open(model_path, "rb") as fh:
+            model = pickle.load(fh, encoding="latin1")
+        verts = model["v_template"].tolist()
+        faces = model["f"].astype(int).tolist()
+        mesh_data = bpy.data.meshes.new(obj_name)
+        mesh_data.from_pydata(verts, [], faces)
+        mesh_data.update()
+        obj = bpy.data.objects.new(obj_name, mesh_data)
+        context.collection.objects.link(obj)
+        return obj
+
+    if ext == ".npz":
+        import numpy as np
+        data = np.load(model_path, allow_pickle=True)
+        verts = data["v_template"].tolist() if "v_template" in data else data["vertices"].tolist()
+        faces = data["f"].astype(int).tolist() if "f" in data else data["faces"].astype(int).tolist()
+        mesh_data = bpy.data.meshes.new(obj_name)
+        mesh_data.from_pydata(verts, [], faces)
+        mesh_data.update()
+        obj = bpy.data.objects.new(obj_name, mesh_data)
+        context.collection.objects.link(obj)
+        return obj
+
+    return None
+
+
 def _write_text(name, content):
     text = bpy.data.texts.get(name) or bpy.data.texts.new(name)
     text.clear()
@@ -163,11 +258,16 @@ def _export_txt(content, blend_filepath):
 def _build_prompt(context, mesh, cameras, videos, props):
     payload = {
         "addon": "video_mocap_mcp",
-        "version": "0.5.0",
+        "version": "0.8.0",
         "blend_file": bpy.data.filepath,
         "scene": context.scene.name,
         "mesh": _mesh_summary(mesh),
         "camera_setup": cameras,
+        "camera_policy": {
+            "protected_camera": props.user_camera.strip() or None,
+            "vmmcp_prefix": "VMMCP_",
+            "deletable": "Any camera whose name does NOT start with 'VMMCP_' and is NOT the protected_camera may be deleted.",
+        },
         "reference_videos": videos,
         "frame_range": {
             "start": props.frame_start,
@@ -176,12 +276,15 @@ def _build_prompt(context, mesh, cameras, videos, props):
         },
     }
 
+    video_list = "\n".join(f"  - {view}: {path}" for view, path in videos.items())
+    camera_list = "\n".join(f"  - {view}: {name}" for view, name in cameras.items())
+
     return (
         "PROMPT FOR CLAUDE CODE (connected to Blender via BlenderMCP)\n"
         "=============================================================\n\n"
 
         "You have full access to Blender through BlenderMCP. You must do ALL the\n"
-        "work yourself: motion extraction, rigging, animation, verification.\n"
+        "work yourself: camera framing, motion extraction, rigging, animation, verification.\n"
         "The user will not intervene — execute everything autonomously.\n\n"
 
         "CONTEXT:\n"
@@ -189,35 +292,63 @@ def _build_prompt(context, mesh, cameras, videos, props):
         "videos showing a person performing a movement filmed from different\n"
         "angles. Your job is to reproduce that movement on the mesh.\n\n"
 
+        "REFERENCE VIDEOS (one per viewpoint):\n"
+        f"{video_list}\n\n"
+
+        "ANALYSIS CAMERAS (already placed in the scene):\n"
+        f"{camera_list}\n\n"
+
+        "CAMERA MANAGEMENT RULES:\n"
+        "  - VMMCP_* cameras (analysis cameras) must NEVER be deleted.\n"
+        + (
+            f"  - '{props.user_camera.strip()}' is the user's protected camera — do NOT delete it under any circumstance.\n"
+            if props.user_camera.strip() else
+            "  - No user camera is protected (user_camera is empty).\n"
+        ) +
+        "  - Every other camera in the scene may be freely deleted if it clutters the setup.\n\n"
+
         "FULL PIPELINE TO EXECUTE:\n\n"
 
+        "STEP 0 — CAMERA FRAMING:\n"
+        "Before anything else, adjust EVERY camera listed above so that the complete\n"
+        "mesh is visible from tip to toe with a small margin.\n"
+        "For each camera:\n"
+        "  a) Switch to orthographic projection (camera.data.type = 'ORTHO')\n"
+        "  b) Set ortho_scale = mesh_bbox_diagonal * 1.15 (15% margin)\n"
+        "  c) Reposition if needed so the mesh center is in frame\n"
+        "  d) Verify by rendering a preview — the mesh must be fully visible\n"
+        "  e) Do NOT skip this step even if cameras appear correctly placed\n\n"
+
         "STEP 1 — MOTION EXTRACTION:\n"
-        "Run 4D-Humans (HMR2.0) on the reference videos to extract SMPL params.\n"
+        "Run 4D-Humans (HMR2.0) on ALL provided reference videos independently.\n"
         "The estimator script is at: estimator/run_4dhumans.py in the addon folder.\n"
         "The Python env is ~/hmr2_env (already set up with all patches).\n"
-        "Run via subprocess:\n"
+        "Run via subprocess FOR EACH VIDEO:\n"
         "  PYTORCH_ENABLE_MPS_FALLBACK=1 ~/hmr2_env/bin/python \\\n"
-        "    estimator/run_4dhumans.py --video <path> --out <path>.npz\n"
+        "    estimator/run_4dhumans.py --video <path> --out <path>_<view>.npz\n"
         "Output: per-frame SMPL parameters (72 axis-angle rotations for 24 joints,\n"
         "10 shape params, root translation) saved as .npz.\n"
-        "If multiple videos are provided, use the one with best visibility for\n"
-        "extraction, and use the others for cross-view verification later.\n"
+        "IMPORTANT: each viewpoint constrains different body parts. Run extraction on\n"
+        "EVERY available video — do not skip any. Use the front/back results as the\n"
+        "primary source, and fuse lateral/top/bottom estimates to resolve ambiguities.\n"
         "NOTE: HMR2 outputs camera-relative poses. The character animates in place.\n\n"
 
         "STEP 2 — RIGGING:\n"
-        "Inspect the mesh from the 6 analysis cameras (already placed in the scene).\n"
+        "Inspect the mesh from ALL 6 analysis cameras.\n"
         "Create an armature with 24 bones matching the SMPL joint names:\n"
         "  pelvis, left_hip, right_hip, spine1, left_knee, right_knee, spine2,\n"
         "  left_ankle, right_ankle, spine3, left_foot, right_foot, neck,\n"
         "  left_collar, right_collar, head, left_shoulder, right_shoulder,\n"
         "  left_elbow, right_elbow, left_wrist, right_wrist, left_hand, right_hand\n"
         "Place bones inside the mesh at anatomically correct positions.\n"
+        "Verify bone placement from EACH of the 6 camera angles before proceeding.\n"
         "Parent the mesh to the armature with automatic weights.\n"
-        "Add IK constraints on ankles and wrists for post-processing.\n"
-        "Verify bone placement from each of the 6 camera angles.\n\n"
+        "Add IK constraints on ankles and wrists for post-processing.\n\n"
 
         "STEP 3 — ANIMATION TRANSFER:\n"
-        "Read the .npz motion data. For each frame, for each joint:\n"
+        "Use the front/back .npz as the base motion. For joints where side/top/bottom\n"
+        "estimates disagree, cross-reference all views and pick the most consistent value.\n"
+        "For each frame, for each joint:\n"
         "  a) Extract axis-angle (3 values) from smpl_poses[frame, joint*3:joint*3+3]\n"
         "  b) Convert to quaternion using scipy.spatial.transform.Rotation\n"
         "     NEVER do manual axis-angle math.\n"
@@ -240,21 +371,27 @@ def _build_prompt(context, mesh, cameras, videos, props):
         "  - Activate IK constraints on ankle bones for those frame ranges\n"
         "  - Pin foot position to the ground plane during contact\n\n"
 
-        "STEP 6 — MULTI-ANGLE VERIFICATION:\n"
-        "This is the quality gate. After animation is applied:\n"
-        "  - Inspect the animated mesh from EACH of the 6 cameras\n"
-        "  - Compare against the reference videos for that angle (if provided)\n"
-        "  - Check for: limbs penetrating mesh, impossible joint angles,\n"
-        "    asymmetric motion that should be symmetric, floating feet\n"
-        "  - If a contradiction is found between views, adjust those frames\n"
-        "  - Do this BEFORE declaring the work done\n\n"
+        "STEP 6 — MULTI-ANGLE VERIFICATION AND CORRECTION:\n"
+        "This is MANDATORY. Execute it for every available viewpoint, not just 'some'.\n"
+        "For EACH reference video listed above:\n"
+        "  a) Switch to the corresponding analysis camera\n"
+        "  b) Play back the animation side-by-side with the reference video\n"
+        "  c) Check every frame for: limbs penetrating mesh, impossible joint angles,\n"
+        "     asymmetric motion that should be symmetric, floating or sliding feet,\n"
+        "     limb positions contradicted by this viewpoint\n"
+        "  d) If ANY contradiction is found — adjust those keyframes immediately\n"
+        "  e) After adjusting, re-verify from ALL other viewpoints to ensure\n"
+        "     the correction did not introduce a new error in another view\n"
+        "Loop until ALL viewpoints are consistent with their reference video.\n"
+        "Do NOT declare the work done until every viewpoint has passed this check.\n\n"
 
         "HARD CONSTRAINTS:\n"
         "  - Bone lengths MUST remain constant across all frames\n"
         "  - Do NOT invent motion for body parts not visible in any video\n"
         "  - Keep mesh parented to the same armature throughout\n"
         "  - Set scene FPS to match motion data FPS before keyframing\n"
-        "  - Ignore objects/people/props not present in the reference videos\n\n"
+        "  - Ignore objects/people/props not present in the reference videos\n"
+        "  - Every provided viewpoint MUST be used — skipping a video is not allowed\n\n"
 
         "PAYLOAD:\n"
         f"{json.dumps(payload, indent=2)}\n"
@@ -272,10 +409,22 @@ class VMMCP_OT_generate(Operator):
 
     def execute(self, context):
         props = context.scene.vmmcp
-        mesh = _target_mesh(context, props)
-        if mesh is None:
-            self.report({"ERROR"}, "Select a mesh object first.")
-            return {"CANCELLED"}
+
+        if props.mesh_source == "SMPL":
+            model_path = bpy.path.abspath(props.smpl_model_path)
+            if not model_path or not os.path.isfile(model_path):
+                self.report({"ERROR"}, "SMPL model file not found — set a valid path.")
+                return {"CANCELLED"}
+            mesh = _import_smpl_mesh(context, model_path, props.smpl_gender)
+            if mesh is None:
+                self.report({"ERROR"}, "Failed to import SMPL mesh. Check file format (.pkl / .obj / .npz).")
+                return {"CANCELLED"}
+            props.mesh_object = mesh.name
+        else:
+            mesh = _target_mesh(context, props)
+            if mesh is None:
+                self.report({"ERROR"}, "Select a mesh object first.")
+                return {"CANCELLED"}
 
         videos = _video_sources(props)
         if not videos:
@@ -308,10 +457,15 @@ class VMMCP_PT_panel(Panel):
         layout = self.layout
         props = context.scene.vmmcp
 
-        # Mesh (auto-detect from selection)
+        # Mesh source
         box = layout.box()
         box.label(text="Mesh", icon="MESH_DATA")
-        box.prop_search(props, "mesh_object", bpy.data, "objects")
+        box.prop(props, "mesh_source", expand=True)
+        if props.mesh_source == "SCENE":
+            box.prop_search(props, "mesh_object", bpy.data, "objects")
+        else:
+            box.prop(props, "smpl_model_path")
+            box.prop(props, "smpl_gender")
 
         # Videos
         box = layout.box()
@@ -330,6 +484,16 @@ class VMMCP_PT_panel(Panel):
         row = box.row(align=True)
         row.prop(props, "frame_start")
         row.prop(props, "frame_end")
+
+        # Camera cleanup
+        box = layout.box()
+        box.label(text="Cameras", icon="CAMERA_DATA")
+        box.prop(props, "cleanup_cameras")
+        if props.cleanup_cameras:
+            row = box.row()
+            row.alert = not props.user_camera.strip()
+            row.prop_search(props, "user_camera", bpy.data, "objects",
+                            icon="CAMERA_DATA")
 
         layout.separator()
 

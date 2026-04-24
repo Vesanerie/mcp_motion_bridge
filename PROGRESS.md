@@ -36,6 +36,8 @@ Claude Code via BlenderMCP
 | Lissage | Quaternions (slerp/log-quat) | Jamais Euler (gimbal lock) |
 | Plateforme | macOS Apple Silicon | Pas de CUDA, MPS non suffisant pour HMR2 |
 | UI | Un seul bouton "Generate Prompt" | L'utilisateur met ses videos, clique, colle dans Claude Code |
+| Mesh source | Scene Mesh ou SMPL Body (.pkl/.obj/.npz) | Permet d'utiliser un mesh SMPL standard sans avoir un mesh custom dans la scene |
+| Cameras | Cleanup optionnel + camera protegee | Evite la pollution de scene sans risquer de supprimer la camera de rendu |
 
 ## Historique
 
@@ -78,6 +80,24 @@ Claude Code via BlenderMCP
 - [x] run_4dhumans.py reecrit avec l'API reelle (load_hmr2 + forward_step)
 - [x] Prompt et UI mis a jour pour 4D-Humans
 
+### 2026-04-24 - Iteration 6 : Sync repo + raffinements workflow (v0.8.0)
+- [x] Fetch/pull origin main : merge des branches minor-tweaks, multi-view-pipeline et smpl-pipeline
+- [x] Branche locale smpl-pipeline creee et trackee
+- [x] Choix de mesh source : "Scene Mesh" (existant) ou "SMPL Body" (import depuis fichier)
+  - Import supporte .pkl (v_template + f), .obj (bpy.ops), .npz (v_template/vertices + f/faces)
+  - Mesh reuse si deja present dans la scene (SMPL_NEUTRAL / SMPL_MALE / SMPL_FEMALE)
+  - Props : mesh_source, smpl_model_path, smpl_gender
+- [x] STEP 0 dans le prompt : Claude ajuste chaque camera en orthographique,
+      ortho_scale = diagonale mesh x 1.15, verifie que le mesh est entierement visible
+- [x] Extraction multi-vues obligatoire : HMR2 tourne sur CHAQUE video fournie,
+      fusion cross-view pour les joints ambigus, plus de "meilleure video uniquement"
+- [x] Verification multi-angles renforcee : check obligatoire sur chaque viewpoint
+      disponible, correction immediate + re-verification croisee apres chaque ajustement
+- [x] Gestion cameras : option "Delete Other Cameras" + camera protegee (render/hero camera)
+  - L'addon supprime les cameras non-VMMCP non-protegees avant de placer les cameras d'analyse
+  - Claude recoit camera_policy dans le payload + regles explicites dans le prompt
+  - UI : alerte rouge si cleanup active sans camera protegee selectionnee
+
 ## Contrainte plateforme
 
 macOS Apple Silicon (M1/M2/M3/M4) :
@@ -108,7 +128,7 @@ macOS Apple Silicon (M1/M2/M3/M4) :
 
 ```
 mcp_motion_bridge/
-├── __init__.py                         # addon Blender v0.7, UI + prompt
+├── __init__.py                         # addon Blender v0.8, UI + prompt
 ├── estimator/
 │   ├── __init__.py
 │   ├── run_mediapipe_ik.py             # PRINCIPAL : MediaPipe + IK → .npz
