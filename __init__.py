@@ -310,138 +310,54 @@ _pipe = {
 _pipe_lock = threading.Lock()
 
 
-def _send_to_claude_app(text):
-    """Send text to the Claude desktop app. Works on macOS and Windows.
-    Copies to clipboard, activates Claude, pastes, and presses Enter.
-    """
-    import sys
-
-    if sys.platform == "darwin":
-        _send_macos(text)
-    elif sys.platform == "win32":
-        _send_windows(text)
-    else:
-        raise RuntimeError("Auto-send supports macOS and Windows only. Use Generate Prompt instead.")
+def _steps_dir():
+    """Return the VMMCP_Steps directory path (next to the .blend file or in temp)."""
+    base = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else bpy.app.tempdir
+    d = os.path.join(base, "VMMCP_Steps")
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
-def _send_macos(text):
-    """macOS: write prompt to temp file, then use AppleScript to paste into Claude."""
-    import tempfile
-
-    # Write to temp file for large prompts (clipboard can truncate)
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
-    tmp.write(text)
-    tmp.close()
-    tmp_path = tmp.name
-
-    # Copy to clipboard
-    subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
-
-    # AppleScript: activate Claude, wait, click input area, paste, send
-    script = '''
-    tell application "Claude" to activate
-    delay 1.0
-
-    tell application "System Events"
-        tell process "Claude"
-            -- Make sure the window is frontmost
-            set frontmost to true
-            delay 0.3
-
-            -- Press Cmd+A to select any existing text, then delete it
-            keystroke "a" using command down
-            delay 0.1
-            key code 51  -- backspace
-            delay 0.2
-
-            -- Paste from clipboard
-            keystroke "v" using command down
-            delay 0.5
-
-            -- Press Enter to send
-            keystroke return
-        end tell
-    end tell
-    '''
-    result = subprocess.run(["osascript", "-e", script],
-                           capture_output=True, text=True, timeout=15)
-
-    try:
-        os.unlink(tmp_path)
-    except OSError:
-        pass
-
-    if result.returncode != 0:
-        raise RuntimeError(f"AppleScript failed: {result.stderr.strip()}")
+def _write_step_file(step_idx, marker, label, full_prompt):
+    """Write a step prompt as a .md file in VMMCP_Steps/."""
+    d = _steps_dir()
+    filename = f"step_{step_idx:02d}_{marker.replace('_OK', '')}.md"
+    path = os.path.join(d, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"# {label}\n\n")
+        f.write(full_prompt)
+    return path
 
 
-def _send_windows(text):
-    """Windows: PowerShell to copy, activate Claude, paste, enter."""
-    import tempfile
+def _write_current_step_pointer(step_idx, path):
+    """Write CURRENT_STEP.md that tells Claude which step to execute."""
+    d = _steps_dir()
+    pointer = os.path.join(d, "CURRENT_STEP.md")
+    with open(pointer, "w", encoding="utf-8") as f:
+        f.write(f"# Current Step: {step_idx}\n\n")
+        f.write(f"Execute the prompt in: {path}\n\n")
+        f.write("After reading this, open and execute the step file above.\n")
+        f.write("When done, signal completion via BlenderMCP:\n")
+        f.write(f"  bpy.context.scene['vmmcp_step_done'] = '<MARKER>'\n")
+        f.write("(The exact marker is specified at the end of the step file.)\n")
+    return pointer
 
-    # Write prompt to temp file (clipboard via PowerShell has size limits)
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False,
-                                     encoding="utf-8")
-    tmp.write(text)
-    tmp.close()
 
-    # PowerShell script: read file to clipboard, activate Claude, paste, enter
-    ps_script = f'''
-Add-Type -AssemblyName System.Windows.Forms
-$text = [System.IO.File]::ReadAllText("{tmp.name.replace(chr(92), '/')}")
-[System.Windows.Forms.Clipboard]::SetText($text)
-Start-Sleep -Milliseconds 200
-
-# Find and activate Claude window
-$claude = Get-Process -Name "Claude" -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($claude) {{
-    Add-Type @"
-    using System;
-    using System.Runtime.InteropServices;
-    public class Win32 {{
-        [DllImport("user32.dll")]
-        public static extern bool SetForegroundWindow(IntPtr hWnd);
-        [DllImport("user32.dll")]
-        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-    }}
-"@
-    [Win32]::ShowWindow($claude.MainWindowHandle, 9)
-    [Win32]::SetForegroundWindow($claude.MainWindowHandle)
-    Start-Sleep -Milliseconds 500
-    [System.Windows.Forms.SendKeys]::SendWait("^v")
-    Start-Sleep -Milliseconds 300
-    [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
-}} else {{
-    throw "Claude app not found. Make sure Claude is running."
-}}
-'''
-    result = subprocess.run(
-        ["powershell", "-NoProfile", "-Command", ps_script],
-        capture_output=True, text=True, timeout=15,
-    )
-    try:
-        os.unlink(tmp.name)
-    except OSError:
-        pass
-
-    if result.returncode != 0:
-        raise RuntimeError(f"PowerShell failed: {result.stderr.strip()}")
+def _clear_steps_dir():
+    """Remove all step files from VMMCP_Steps/."""
+    d = _steps_dir()
+    for f in os.listdir(d):
+        if f.endswith(".md"):
+            os.unlink(os.path.join(d, f))
 
 
 def _run_one_step(marker, label, full_prompt):
-    """Blocking — sends the step prompt to Claude Code app via AppleScript."""
+    """Write step prompt to .md file."""
     with _pipe_lock:
-        _pipe["status"] = f"Sending {label} to Claude Code…"
-    try:
-        _send_to_claude_app(full_prompt)
-    except Exception as exc:
-        with _pipe_lock:
-            _pipe["error"] = f"{label}: {exc}"
-            _pipe["running"] = False
-        return
-
-    with _pipe_lock:
-        _pipe["status"] = f"{label} — sent to Claude Code"
+        idx = _pipe["step_idx"]
+        path = _write_step_file(idx, marker, label, full_prompt)
+        _write_current_step_pointer(idx, path)
+        _pipe["status"] = f"{label} — written to {os.path.basename(path)}"
 
 
 def _pipeline_tick():
@@ -1118,25 +1034,31 @@ class VMMCP_OT_run_pipeline(Operator):
             _pipe["thread"] = None
             _pipe["scene_name"] = context.scene.name
 
-        # Init marker and send first step
+        # Clear old step files and marker
+        _clear_steps_dir()
         context.scene["vmmcp_step_done"] = ""
 
-        idx = _pipe["step_idx"]
+        # Write ALL step files at once
         steps = _pipe["steps"]
-        marker, label, step_text = steps[idx]
-        full_prompt = _pipe["history"] + "\n\n" + step_text
+        for i, (marker, label, step_text) in enumerate(steps):
+            full_prompt = _pipe["history"] + "\n\n" + step_text
+            _write_step_file(i, marker, label, full_prompt)
 
-        try:
-            _send_to_claude_app(full_prompt)
-        except Exception as exc:
-            self.report({"ERROR"}, str(exc))
-            props.pipeline_status = f"ERROR: {exc}"
-            return {"CANCELLED"}
+        # Point to step 0
+        marker, label, step_text = steps[0]
+        first_path = _write_step_file(0, marker, label, _pipe["history"] + "\n\n" + step_text)
+        _write_current_step_pointer(0, first_path)
 
-        _pipe["step_idx"] = idx + 1
-        props.pipeline_status = f"Step 1/{len(steps)} sent: {label} — waiting for Claude..."
+        _pipe["step_idx"] = 1
+        steps_dir = _steps_dir()
+        props.pipeline_status = f"Step 1/{len(steps)}: {label} — tell Claude to read {steps_dir}"
         props.pipeline_running = len(steps) > 1
-        self.report({"INFO"}, f"Sent to Claude Code: {label}")
+
+        # Copy the instruction to clipboard
+        instruction = f"Read and execute the step in {first_path}"
+        context.window_manager.clipboard = instruction
+
+        self.report({"INFO"}, f"{len(steps)} steps written to {steps_dir}")
         return {"FINISHED"}
 
 
@@ -1169,23 +1091,23 @@ class VMMCP_OT_next_step(Operator):
             return {"FINISHED"}
 
         marker, label, step_text = steps[idx]
-        full_prompt = _pipe["history"] + "\n\n" + step_text
 
-        # Clear the marker before sending the new step
+        # Clear the marker before pointing to the new step
         context.scene["vmmcp_step_done"] = ""
 
-        try:
-            _send_to_claude_app(full_prompt)
-        except Exception as exc:
-            self.report({"ERROR"}, str(exc))
-            props.pipeline_status = f"ERROR: {exc}"
-            return {"CANCELLED"}
+        # Update CURRENT_STEP.md to point to this step
+        step_path = os.path.join(_steps_dir(),
+                                 f"step_{idx:02d}_{marker.replace('_OK', '')}.md")
+        _write_current_step_pointer(idx, step_path)
+
+        # Copy instruction to clipboard
+        context.window_manager.clipboard = f"Read and execute the step in {step_path}"
 
         _pipe["step_idx"] = idx + 1
         remaining = len(steps) - _pipe["step_idx"]
-        props.pipeline_status = f"Step {idx + 1}/{len(steps)} sent: {label} — waiting for Claude..."
+        props.pipeline_status = f"Step {idx + 1}/{len(steps)}: {label} — tell Claude to read the file"
         props.pipeline_running = remaining > 0
-        self.report({"INFO"}, f"Sent: {label} ({remaining} remaining)")
+        self.report({"INFO"}, f"Step ready: {label} — paste instruction in Claude Code")
         return {"FINISHED"}
 
 
@@ -1238,21 +1160,21 @@ class VMMCP_OT_reset_pipeline(Operator):
                         bpy.data.actions.remove(arm.animation_data.action)
                         self.report({"INFO"}, f"Cleared animation on {arm.name}")
 
-        # Send reset message to Claude Code
-        reset_prompt = (
-            "PIPELINE RESET\n"
-            "==============\n"
-            "The user has reset the motion capture pipeline.\n"
-            "All previous steps are cancelled. Animation data has been cleared.\n"
-            "Forget all previous VMMCP step context.\n"
-            "Wait for the next step prompt — do not take any action now.\n"
-            "Confirm by executing: bpy.context.scene['vmmcp_step_done'] = 'RESET_OK'\n"
-        )
-        try:
-            _send_to_claude_app(reset_prompt)
-            self.report({"INFO"}, "Pipeline reset — sent to Claude Code")
-        except Exception as exc:
-            self.report({"WARNING"}, f"Reset done locally but failed to notify Claude: {exc}")
+        # Clear step files and write reset notice
+        _clear_steps_dir()
+        d = _steps_dir()
+        reset_path = os.path.join(d, "RESET.md")
+        with open(reset_path, "w", encoding="utf-8") as f:
+            f.write("# PIPELINE RESET\n\n")
+            f.write("The user has reset the motion capture pipeline.\n")
+            f.write("All previous steps are cancelled. Animation data has been cleared.\n")
+            f.write("Forget all previous VMMCP step context.\n")
+            f.write("Wait for the next step prompt — do not take any action now.\n")
+            f.write("Confirm by executing via BlenderMCP:\n")
+            f.write("  bpy.context.scene['vmmcp_step_done'] = 'RESET_OK'\n")
+
+        context.window_manager.clipboard = f"Read and execute {reset_path}"
+        self.report({"INFO"}, f"Pipeline reset — tell Claude to read {reset_path}")
 
         return {"FINISHED"}
 
@@ -1326,20 +1248,20 @@ class VMMCP_PT_panel(Panel):
 
         layout.separator()
 
-        # Auto pipeline — sends to Claude Code app
+        # Pipeline — file-based steps
         box = layout.box()
-        box.label(text="Send to Claude Code", icon="PLAY")
+        box.label(text="Pipeline", icon="PLAY")
+
+        steps = _pipe.get("steps", [])
+        idx = _pipe.get("step_idx", 0)
+
         if props.pipeline_status:
             err = "error" in props.pipeline_status.lower()
             done = "all" in props.pipeline_status.lower() and "done" in props.pipeline_status.lower()
             icon = "ERROR" if err else ("CHECKMARK" if done else "INFO")
             box.label(text=props.pipeline_status, icon=icon)
 
-        steps = _pipe.get("steps", [])
-        idx = _pipe.get("step_idx", 0)
-
         if steps and idx > 0 and idx <= len(steps):
-            # Show what we're waiting for
             prev_marker = steps[idx - 1][0]
             scene_marker = context.scene.get("vmmcp_step_done", "")
             if scene_marker == prev_marker:
@@ -1347,17 +1269,19 @@ class VMMCP_PT_panel(Panel):
             else:
                 box.label(text="Waiting for Claude to finish...", icon="TIME")
 
+        if not steps or idx >= len(steps):
+            box.operator("video_mocap.run_pipeline", icon="PLAY",
+                         text="Generate Steps")
         if props.pipeline_running and idx < len(steps):
             row = box.row()
             row.enabled = VMMCP_OT_next_step.poll(context)
             row.operator("video_mocap.next_step", icon="FORWARD",
                          text=f"Next Step ({idx + 1}/{len(steps)}) →")
-        elif not steps or idx >= len(steps):
-            box.operator("video_mocap.run_pipeline", icon="PLAY",
-                         text="Start Pipeline")
 
-        # Reset button — always visible when pipeline has been started
+        # Show steps folder path
         if steps:
+            box.label(text=f"Steps folder: VMMCP_Steps/", icon="FILE_FOLDER")
+            box.label(text="Paste clipboard in Claude Code", icon="INFO")
             box.separator()
             box.operator("video_mocap.reset_pipeline", icon="FILE_REFRESH",
                          text="Reset (back to Step 0)")
