@@ -3,6 +3,10 @@
 Add-on Blender pour preparer une scene de rigging/animation pilotee par Claude
 via BlenderMCP.
 
+BlenderMCP est indispensable. MCP_motion_bridge ne peut pas fonctionner seul :
+il prepare le contexte et les requetes, mais Claude doit executer les actions
+dans Blender via BlenderMCP.
+
 Le but n'est pas de faire une mocap MediaPipe locale. Le flux attendu est :
 
 ```text
@@ -34,13 +38,41 @@ Le bouton `Rig Mesh` :
   `VMMCP_TOP_Camera`, `VMMCP_BOTTOM_Camera`;
 - collecte les infos utiles du mesh : vertex count, polygons, bounding box,
   transforms, modifiers, materials, shape keys;
+- transmet a Claude le type de rig cible et le nombre de bones demande;
 - genere une requete MCP dans un text block Blender nomme
   `VMMCP_Rig_Mesh_Request`;
-- copie aussi cette requete dans le presse-papiers.
+- copie aussi cette requete dans le presse-papiers;
+- exporte cette requete en `.txt` pour pouvoir la coller plus tard dans une
+  nouvelle conversation Claude.
 
 Cette requete demande a Claude, via BlenderMCP, d'inspecter le mesh et les six
 vues camera, puis de creer une armature adaptee au mesh. Le mesh doit etre lie
 aux bones crees, avec des controles utilisables quand c'est pertinent.
+
+## Nombre de bones
+
+L'utilisateur choisit :
+
+- `Rig Target` : `Custom`, `Rigify` ou `Unreal`;
+- `Bones` : nombre de bones cible pour l'armature.
+
+Le nombre de bones est transmis a Claude comme une contrainte de production.
+Claude peut l'ajuster legerement si la topologie du mesh l'exige, mais la
+requete lui demande de respecter l'intention.
+
+Guide de base :
+
+| Usage | Recommandation |
+|-------|----------------|
+| Prop simple ou objet rigide | 8-25 bones |
+| Humanoide Unreal / game engine | 50-70 deformation bones |
+| Humanoide Rigify | 80-120 bones, controles inclus |
+| Creature ou personnage complexe | 90-180 bones selon l'anatomie |
+| Visage/mains tres detailles | 120+ bones ou combinaison bones + shape keys |
+
+Pour Unreal, privilegier une hierarchie stable, un root clair, un pelvis separe,
+et des noms compatibles export. Pour Rigify, privilegier des controles FK/IK
+propres et une deformation anatomiquement coherente.
 
 ### 2. Animate
 
@@ -50,19 +82,45 @@ Le bouton `Animate` :
 - utilise les videos ou la suite d'images fournies dans le panneau;
 - cree ou met a jour le setup camera si l'option est active;
 - genere une requete MCP dans `VMMCP_Animate_Request`;
-- copie la requete dans le presse-papiers.
+- copie la requete dans le presse-papiers;
+- exporte cette requete en `.txt`.
 
 Cette requete demande a Claude d'analyser les references video/image et
 d'animer le rig existant sur la plage de frames choisie. L'animation doit etre
 bakee sur les bones du rig du mesh, pas sur une armature separee.
 
+La requete d'animation impose aussi deux regles :
+
+- les objets, personnages, accessoires, decors ou mouvements qui ne sont pas
+  presents dans les references fournies doivent etre ignores;
+- Claude doit comparer les poses animees avec chaque angle disponible
+  (`front`, `back`, `left`, `right`, `top`, `bottom`) depuis les cameras
+  `VMMCP_*`, puis corriger la pose si un angle contredit un autre.
+
+## Sauvegarde de la requete
+
+Les boutons `Rig Mesh` et `Animate` creent un prompt complet pret a coller dans
+une nouvelle conversation Claude. Ce prompt rappelle a Claude qu'il doit etre
+connecte a Blender via BlenderMCP avant d'executer le travail.
+
+L'add-on garde trois copies de la derniere requete :
+
+- dans le presse-papiers;
+- dans un text block Blender (`VMMCP_Rig_Mesh_Request` ou
+  `VMMCP_Animate_Request`);
+- dans un fichier `.txt`.
+
+Le bouton `Copy Request to txt` reexporte manuellement la derniere requete si
+l'utilisateur a ferme ou oublie d'ouvrir une conversation Claude.
+
 ## Utilisation
 
-1. Installer et activer BlenderMCP.
+1. Installer et activer BlenderMCP. C'est obligatoire.
 2. Installer cet add-on dans Blender.
 3. Ouvrir la scene contenant le mesh a rigger.
 4. Dans `View3D > Sidebar > Mocap`, choisir le mesh.
-5. Renseigner les sources disponibles :
+5. Choisir `Rig Target` et le nombre de `Bones`.
+6. Renseigner les sources disponibles :
    - `Front`
    - `Back`
    - `Left`
@@ -70,11 +128,11 @@ bakee sur les bones du rig du mesh, pas sur une armature separee.
    - `Top`
    - `Bottom`
    - ou `Image Sequence`
-6. Cliquer sur `Rig Mesh`.
-7. Envoyer la requete generee a Claude dans la conversation connectee a
+7. Cliquer sur `Rig Mesh`.
+8. Envoyer la requete generee a Claude dans la conversation connectee a
    BlenderMCP.
-8. Une fois le rig cree, cliquer sur `Animate`.
-9. Envoyer la seconde requete a Claude.
+9. Une fois le rig cree, cliquer sur `Animate`.
+10. Envoyer la seconde requete a Claude.
 
 ## Operateurs exposes
 
@@ -83,6 +141,7 @@ bakee sur les bones du rig du mesh, pas sur une armature separee.
 | `video_mocap.setup_cameras` | Cree ou met a jour les six cameras d'analyse autour du mesh |
 | `video_mocap.rig_mesh` | Prepare la requete MCP pour que Claude cree le rig du mesh |
 | `video_mocap.animate` | Prepare la requete MCP pour que Claude anime le rig depuis les videos/images |
+| `video_mocap.copy_request_to_txt` | Exporte la derniere requete en fichier `.txt` |
 
 ## Propriete importante
 
@@ -93,9 +152,11 @@ Les proprietes sont disponibles dans `bpy.context.scene.vmmcp` :
 - `top_video`, `bottom_video`
 - `image_sequence_dir`
 - `frame_start`, `frame_end`
+- `rig_preset`, `requested_bone_count`
 - `create_camera_setup`
 - `camera_distance`
 - `request_text_name`
+- `request_txt_path`
 
 ## Limite MCP importante
 
