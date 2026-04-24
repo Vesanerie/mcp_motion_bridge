@@ -311,23 +311,22 @@ _pipe_lock = threading.Lock()
 
 
 def _send_to_claude_app(text):
-    """Send text to the Claude Code desktop app via AppleScript (macOS).
+    """Send text to the Claude desktop app. Works on macOS and Windows.
     Copies to clipboard, activates Claude, pastes, and presses Enter.
     """
     import sys
-    if sys.platform != "darwin":
-        raise RuntimeError("Auto-send only works on macOS. Use Generate Prompt instead.")
 
-    # Save to a temp file and use pbcopy for reliable clipboard handling
-    import tempfile
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
-    tmp.write(text)
-    tmp.close()
+    if sys.platform == "darwin":
+        _send_macos(text)
+    elif sys.platform == "win32":
+        _send_windows(text)
+    else:
+        raise RuntimeError("Auto-send supports macOS and Windows only. Use Generate Prompt instead.")
 
-    # Copy to clipboard via pbcopy (handles large text better than AppleScript)
+
+def _send_macos(text):
+    """macOS: AppleScript to activate Claude, paste, enter."""
     subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
-
-    # AppleScript: activate Claude, paste, press Enter
     script = '''
     tell application "Claude" to activate
     delay 0.5
@@ -339,10 +338,61 @@ def _send_to_claude_app(text):
     '''
     result = subprocess.run(["osascript", "-e", script],
                            capture_output=True, text=True, timeout=10)
-    os.unlink(tmp.name)
-
     if result.returncode != 0:
         raise RuntimeError(f"AppleScript failed: {result.stderr.strip()}")
+
+
+def _send_windows(text):
+    """Windows: PowerShell to copy, activate Claude, paste, enter."""
+    import tempfile
+
+    # Write prompt to temp file (clipboard via PowerShell has size limits)
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False,
+                                     encoding="utf-8")
+    tmp.write(text)
+    tmp.close()
+
+    # PowerShell script: read file to clipboard, activate Claude, paste, enter
+    ps_script = f'''
+Add-Type -AssemblyName System.Windows.Forms
+$text = [System.IO.File]::ReadAllText("{tmp.name.replace(chr(92), '/')}")
+[System.Windows.Forms.Clipboard]::SetText($text)
+Start-Sleep -Milliseconds 200
+
+# Find and activate Claude window
+$claude = Get-Process -Name "Claude" -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($claude) {{
+    Add-Type @"
+    using System;
+    using System.Runtime.InteropServices;
+    public class Win32 {{
+        [DllImport("user32.dll")]
+        public static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")]
+        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    }}
+"@
+    [Win32]::ShowWindow($claude.MainWindowHandle, 9)
+    [Win32]::SetForegroundWindow($claude.MainWindowHandle)
+    Start-Sleep -Milliseconds 500
+    [System.Windows.Forms.SendKeys]::SendWait("^v")
+    Start-Sleep -Milliseconds 300
+    [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
+}} else {{
+    throw "Claude app not found. Make sure Claude is running."
+}}
+'''
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", ps_script],
+        capture_output=True, text=True, timeout=15,
+    )
+    try:
+        os.unlink(tmp.name)
+    except OSError:
+        pass
+
+    if result.returncode != 0:
+        raise RuntimeError(f"PowerShell failed: {result.stderr.strip()}")
 
 
 def _run_one_step(marker, label, full_prompt):
