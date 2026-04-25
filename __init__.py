@@ -543,15 +543,21 @@ def _build_steps(videos, props):
         ))
 
     steps.append(wrap("STEP_1_OK", "Step 1 — Motion Extraction",
-        "PRIMARY: ~/mp_env/bin/python estimator/run_mediapipe_ik.py\n"
-        "  --video <path> --out <path>.npz    (run for EACH video / crop)\n"
-        "COORDINATE CONVERSION (mandatory before any IK):\n"
-        "  MediaPipe X=right Y=down Z=away -> Blender: blender = (-mp.x, mp.z, -mp.y)\n"
-        "FALLBACK if MediaPipe fails: ~/hmr2_env via run_4dhumans.py\n"
-        "  WARNING: HMR2 on Apple MPS gives near-static poses on large movements\n"
-        "  — verify output variance (expect std > 0.5 per joint) before trusting.\n"
-        "VISUAL AIDS: grids / markers / strong lines on character -> hard constraints.\n"
-        "Report: list of .npz files and their frame counts.\n"
+        "PRIMARY estimator: 4D-Humans (HMR2) — outputs real SMPL rotations.\n"
+        "Run via subprocess:\n"
+        "  PYTORCH_ENABLE_MPS_FALLBACK=1 ~/hmr2_env/bin/python \\\n"
+        "    estimator/run_4dhumans.py --video <path> --out <path>.npz\n"
+        "Run for EACH video / crop separately.\n"
+        "Output: .npz with smpl_poses (N,72) axis-angle rotations for 24 joints,\n"
+        "  smpl_betas (10,) body shape, smpl_trans (N,3) camera translation.\n"
+        "These are REAL SMPL rotations from a trained neural network, not IK.\n\n"
+        "FALLBACK if HMR2 fails:\n"
+        "  ~/mp_env/bin/python estimator/run_mediapipe_ik.py \\\n"
+        "    --video <path> --out <path>.npz\n\n"
+        "IMPORTANT: HMR2 outputs are in SMPL coordinate system (Y-up).\n"
+        "The axis conversion to Blender is handled in Step 3 using the\n"
+        "mesh orientation settings from the shared context.\n"
+        "Report: list of .npz files, frame counts, estimator used.\n"
     ))
 
     steps.append(wrap("STEP_2a_OK", "Step 2a — Bone Survey",
@@ -597,17 +603,21 @@ def _build_steps(videos, props):
         f"The mesh forward axis is: {props.mesh_forward}\n"
         f"The mesh up axis is: {props.mesh_up}\n"
         f"The mesh rest pose is: {props.rest_pose}\n"
-        "MediaPipe outputs in its own coordinate system:\n"
-        "  MediaPipe: X=right, Y=down, Z=away-from-camera (subject faces -Z)\n"
+        "HMR2/SMPL outputs in Y-up coordinate system:\n"
+        "  SMPL: X=right, Y=up, Z=toward-camera (subject faces +Z)\n"
+        "  Blender default: X=right, Z=up, -Y=forward\n"
         "You MUST build a global rotation matrix that maps:\n"
-        f"  MediaPipe forward (-Z) --> Mesh forward ({props.mesh_forward})\n"
-        f"  MediaPipe up (-Y)      --> Mesh up ({props.mesh_up})\n"
-        f"  MediaPipe right (+X)   --> derived from forward x up\n"
+        f"  SMPL forward (+Z)  --> Mesh forward ({props.mesh_forward})\n"
+        f"  SMPL up (+Y)       --> Mesh up ({props.mesh_up})\n"
+        f"  SMPL right (+X)    --> derived from forward x up\n"
         "Compute this matrix ONCE before the frame loop using scipy:\n"
         "  from scipy.spatial.transform import Rotation\n"
-        "  # Build source basis (MediaPipe): forward=-Z, up=-Y, right=+X\n"
-        "  # Build target basis: forward=mesh_forward, up=mesh_up\n"
-        "  # global_rot = target_basis @ inverse(source_basis)\n"
+        "  import numpy as np\n"
+        "  # For default Blender mesh (-Y forward, +Z up):\n"
+        "  # SMPL +Z -> Blender -Y, SMPL +Y -> Blender +Z, SMPL +X -> Blender +X\n"
+        "  # This is a -90 degree rotation around X axis\n"
+        "  global_rot = Rotation.from_euler('x', -90, degrees=True)\n"
+        "  # Adjust if mesh_forward or mesh_up differ from Blender defaults.\n"
         "Apply global_rot to EVERY axis-angle rotation and root translation.\n"
         "Without this, the character will face the wrong direction, be flipped,\n"
         "or have twisted limbs.\n\n"
@@ -624,9 +634,9 @@ def _build_steps(videos, props):
         "  b) Convert to rotation: r = Rotation.from_rotvec(aa)\n"
         "  c) Apply global orientation: r_oriented = global_rot * r\n"
         "  d) Convert to Blender quaternion:\n"
-        "     q = r_oriented.as_quat()  # scipy [x,y,z,w]\n"
-        "     q_bl = Quaternion((q[3], q[0], q[1], q[2]))  # Blender [w,x,y,z]\n"
-        "  e) Apply rest-offset composition:\n"
+        "     q = r_oriented.as_quat()  # scipy returns [x,y,z,w]\n"
+        "     q_bl = Quaternion((q[3], q[0], q[1], q[2]))  # Blender wants [w,x,y,z]\n"
+        "  e) Apply rest-offset composition (MANDATORY for every bone):\n"
         "     rig_bone = smpl_to_rig[joint]\n"
         "     final = rest_inv[rig_bone] @ q_bl @ rest_offsets[rig_bone]\n"
         "  f) pb.rotation_mode = 'QUATERNION'\n"
@@ -635,15 +645,17 @@ def _build_steps(videos, props):
 
         "ROOT MOTION every frame:\n"
         "  t = smpl_trans[f]\n"
-        "  # Apply the same global orientation to translation:\n"
         "  t_oriented = global_rot.apply(t)\n"
         "  root_pb.location = Vector(t_oriented)\n"
         "  root_pb.keyframe_insert('location', frame=f)\n\n"
 
-        "VERIFY on frame 0: the mesh should be in the same pose as the\n"
-        "reference video frame 0. If the character faces the wrong way or\n"
-        "is upside down, the global_rot matrix is wrong — fix it before\n"
-        "continuing.\n"
+        "VERIFY on frame 0:\n"
+        "  - Play the animation and check frame 0\n"
+        "  - The character should stand upright facing the same way as the video\n"
+        "  - Arms should not be twisted or flipped\n"
+        "  - If wrong: adjust global_rot (try different euler angles)\n"
+        "  - Common fix: if character faces wrong way, add 180° Y rotation\n"
+        "  - Common fix: if character is sideways, try 'y', 90 instead of 'x', -90\n"
         "Report: bones animated, total keyframes, orientation verified.\n"
     ))
 
@@ -896,8 +908,8 @@ class VMMCP_PT_panel(Panel):
 
         layout.separator()
         info = layout.box()
-        info.label(text="Primary: MediaPipe IK  (~/mp_env)", icon="ARMATURE_DATA")
-        info.label(text="Fallback: HMR2  (~/hmr2_env, MPS)")
+        info.label(text="Primary: 4D-Humans HMR2 (~/hmr2_env)", icon="ARMATURE_DATA")
+        info.label(text="Fallback: MediaPipe IK (~/mp_env)")
 
 
 # ------------------------------------------------------------------

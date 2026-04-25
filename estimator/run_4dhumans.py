@@ -2,18 +2,18 @@
 """
 4D-Humans (HMR2.0) SMPL estimator — macOS Apple Silicon compatible.
 
-Runs OUTSIDE Blender in ~/hmr2_env.
-Extracts per-frame SMPL parameters from a monocular video.
-
-Setup (already done if you followed the install):
-    ~/hmr2_env with torch, hmr2 (--no-deps), pytorch-lightning, smplx,
-    timm, einops, yacs, opencv-python, numpy, scipy, omegaconf
-    + patched chumpy stub + patched renderer imports + patched weights_only
-    + SMPL_NEUTRAL.pkl cleaned of chumpy objects
+Extracts per-frame SMPL parameters (24 joint rotations + shape + translation)
+from a monocular video using HMR2.0.
 
 Usage:
-    PYTORCH_ENABLE_MPS_FALLBACK=1 ~/hmr2_env/bin/python run_4dhumans.py \\
+    PYTORCH_ENABLE_MPS_FALLBACK=1 ~/hmr2_env/bin/python run_4dhumans.py \
         --video /path/to/video.mp4 --out motion.npz
+
+Outputs .npz with:
+    smpl_poses  (N, 72)  axis-angle rotations for 24 joints
+    smpl_betas  (10,)    body shape (median across frames)
+    smpl_trans  (N, 3)   camera-relative translation
+    fps         scalar   video frame rate
 """
 
 import argparse
@@ -53,21 +53,23 @@ def main():
 
     import cv2
     import torch
-    from hmr2.models import load_hmr2
-    from hmr2.configs import get_config
-    from hmr2.utils import recursive_to
-    from hmr2.datasets.vitdet_dataset import ViTDetDataset, DEFAULT_MEAN, DEFAULT_STD
-    from hmr2.utils.geometry import aa_to_rotmat
+    from scipy.spatial.transform import Rotation
 
     device = _detect_device(args.device)
     print(f"[4dhumans] Device: {device}")
 
     # Load model
     print("[4dhumans] Loading HMR2 model...")
+    from hmr2.models import load_hmr2
     model, model_cfg = load_hmr2()
     model = model.to(device)
     model.eval()
-    print("[4dhumans] Model ready")
+
+    img_size = model_cfg.MODEL.IMAGE_SIZE  # 256
+
+    # HMR2 normalization constants
+    MEAN = [0.485, 0.456, 0.406]
+    STD = [0.229, 0.224, 0.225]
 
     # Open video
     cap = cv2.VideoCapture(args.video)
@@ -77,8 +79,10 @@ def main():
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"[4dhumans] Video: {width}x{height} @ {fps:.1f} fps, ~{total} frames")
 
-    img_size = model_cfg.MODEL.IMAGE_SIZE  # 256
-    bbox_shape = model_cfg.MODEL.get("BBOX_SHAPE", [192, 256])
+    # Center crop: assume person is roughly centered
+    crop_size = min(width, height)
+    x_off = (width - crop_size) // 2
+    y_off = (height - crop_size) // 2
 
     all_poses = []
     all_betas = []
@@ -86,73 +90,53 @@ def main():
     frame_idx = 0
     t0 = time.time()
 
-    # Center crop bbox (assume person centered in frame)
-    cx, cy = width / 2, height / 2
-    box_size = min(width, height) * 0.85
-    center_bbox = np.array([cx - box_size/2, cy - box_size/2,
-                            cx + box_size/2, cy + box_size/2])
-
     while True:
         ok, frame_bgr = cap.read()
         if not ok:
             break
 
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
-        # Crop and resize to model input size
-        x1, y1, x2, y2 = center_bbox.astype(int)
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(width, x2), min(height, y2)
-        crop = frame_rgb[y1:y2, x1:x2]
+        # Center crop + resize to model input
+        crop = frame_bgr[y_off:y_off + crop_size, x_off:x_off + crop_size]
         crop_resized = cv2.resize(crop, (img_size, img_size))
+        crop_rgb = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2RGB)
 
-        # Normalize
-        img_tensor = torch.from_numpy(crop_resized).float().permute(2, 0, 1) / 255.0
+        # Normalize: [0,255] -> [0,1] -> ImageNet normalize
+        img_tensor = torch.from_numpy(crop_rgb).float().permute(2, 0, 1) / 255.0
         for c in range(3):
-            img_tensor[c] = (img_tensor[c] - DEFAULT_MEAN[c]) / DEFAULT_STD[c]
+            img_tensor[c] = (img_tensor[c] - MEAN[c]) / STD[c]
 
-        batch = {
-            "img": img_tensor.unsqueeze(0).to(device),
-        }
+        batch = {"img": img_tensor.unsqueeze(0).to(device)}
 
         with torch.no_grad():
             out = model.forward_step(batch, train=False)
 
-        # Extract SMPL params
-        pred_pose = out["pred_smpl_params"]["body_pose"]   # (1, 23, 3, 3) rotmats
-        pred_root = out["pred_smpl_params"]["global_orient"]  # (1, 1, 3, 3)
-        pred_betas = out["pred_smpl_params"]["betas"]      # (1, 10)
+        smpl_params = out["pred_smpl_params"]
 
-        # Convert rotation matrices to axis-angle
-        from scipy.spatial.transform import Rotation as R
+        # Global orient: (1, 1, 3, 3) rotation matrix -> axis-angle (3,)
+        global_mat = smpl_params["global_orient"][0, 0].cpu().numpy()
+        global_aa = Rotation.from_matrix(global_mat).as_rotvec().astype(np.float32)
 
-        # Global orient (1 joint)
-        root_mat = pred_root[0, 0].cpu().numpy()
-        root_aa = R.from_matrix(root_mat).as_rotvec().astype(np.float32)
-
-        # Body pose (23 joints)
-        body_mats = pred_pose[0].cpu().numpy()  # (23, 3, 3)
-        body_aa = np.zeros((23, 3), dtype=np.float32)
+        # Body pose: (1, 23, 3, 3) rotation matrices -> axis-angle (69,)
+        body_mats = smpl_params["body_pose"][0].cpu().numpy()  # (23, 3, 3)
+        body_aa = np.zeros(69, dtype=np.float32)
         for j in range(23):
-            body_aa[j] = R.from_matrix(body_mats[j]).as_rotvec()
+            body_aa[j*3:j*3+3] = Rotation.from_matrix(body_mats[j]).as_rotvec()
 
-        # Concatenate: root (3) + body (69) = 72
-        pose_72 = np.concatenate([root_aa, body_aa.flatten()])
+        # Concatenate: global (3) + body (69) = 72
+        pose_72 = np.concatenate([global_aa, body_aa])
         all_poses.append(pose_72)
 
-        betas = pred_betas[0].cpu().numpy().astype(np.float32)
+        # Betas: (1, 10)
+        betas = smpl_params["betas"][0].cpu().numpy().astype(np.float32)
         all_betas.append(betas)
 
-        # Camera translation (approximate)
-        if "pred_cam_t_full" in out:
-            trans = out["pred_cam_t_full"][0].cpu().numpy().astype(np.float32)
-        elif "pred_cam" in out:
-            cam = out["pred_cam"][0].cpu().numpy()
-            # Weak-perspective to translation approximation
-            trans = np.array([cam[1], cam[2], 2 * 5000.0 / (img_size * cam[0] + 1e-9)],
-                            dtype=np.float32)
-        else:
-            trans = np.zeros(3, dtype=np.float32)
+        # Camera translation: weak-perspective -> approximate 3D translation
+        pred_cam = out["pred_cam"][0].cpu().numpy()  # (3,) [scale, tx, ty]
+        s, tx, ty = pred_cam
+        # Approximate translation: tz from scale, tx/ty from camera params
+        focal = 5000.0  # HMR2 default focal length
+        tz = 2.0 * focal / (img_size * s + 1e-9)
+        trans = np.array([tx, ty, tz], dtype=np.float32)
         all_trans.append(trans)
 
         frame_idx += 1
@@ -164,26 +148,33 @@ def main():
     cap.release()
     elapsed = time.time() - t0
     print(f"[4dhumans] Done: {frame_idx} frames in {elapsed:.1f}s "
-          f"({frame_idx/elapsed:.1f} fps)")
+          f"({frame_idx / max(elapsed, 0.1):.1f} fps)")
+
+    if not all_poses:
+        print("ERROR: no frames processed", file=sys.stderr)
+        return 1
+
+    # Use median betas (body shape should be constant)
+    median_betas = np.median(np.array(all_betas), axis=0).astype(np.float32)
 
     # Save
-    sys.path.insert(0, os.path.dirname(__file__))
-    from smpl_output import save_smpl_npz
-
-    median_betas = np.median(np.array(all_betas), axis=0)
     output_path = args.out if args.out.endswith(".npz") else args.out + ".npz"
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
 
-    save_smpl_npz(
-        output_path=output_path,
-        smpl_poses=np.array(all_poses),
+    np.savez_compressed(
+        output_path,
+        smpl_poses=np.array(all_poses, dtype=np.float32),
         smpl_betas=median_betas,
-        smpl_trans=np.array(all_trans),
-        joints_3d=None,
-        fps=fps,
-        video_width=width,
-        video_height=height,
-        estimator_name="4dhumans",
+        smpl_trans=np.array(all_trans, dtype=np.float32),
+        fps=np.float32(fps),
+        frame_count=np.int32(frame_idx),
+        video_width=np.int32(width),
+        video_height=np.int32(height),
+        estimator=np.array("4dhumans"),
     )
+
+    size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    print(f"[4dhumans] Saved {frame_idx} frames to {output_path} ({size_mb:.1f} MB)")
     return 0
 
 
