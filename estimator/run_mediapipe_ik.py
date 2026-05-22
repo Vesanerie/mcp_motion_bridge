@@ -11,8 +11,8 @@ CUDA or problematic dependencies (no chumpy, no detectron2).
 
 Dependencies: mediapipe, opencv-python, numpy, scipy
 Install:
-    python3.11 -m venv ~/mp_env
-    source ~/mp_env/bin/activate
+    python3.11 -m venv ~/Desktop/OUTIL/video_mocap_mcp/envs/mp_env
+    source ~/Desktop/OUTIL/video_mocap_mcp/envs/mp_env/bin/activate
     pip install mediapipe opencv-python numpy scipy
 
 Usage:

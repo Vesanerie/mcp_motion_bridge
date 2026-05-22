@@ -6,7 +6,7 @@ Extracts per-frame SMPL parameters (24 joint rotations + shape + translation)
 from a monocular video using HMR2.0.
 
 Usage:
-    PYTORCH_ENABLE_MPS_FALLBACK=1 ~/hmr2_env/bin/python run_4dhumans.py \
+    PYTORCH_ENABLE_MPS_FALLBACK=1 ~/Desktop/OUTIL/video_mocap_mcp/envs/hmr2_env/bin/python run_4dhumans.py \
         --video /path/to/video.mp4 --out motion.npz
 
 Outputs .npz with:

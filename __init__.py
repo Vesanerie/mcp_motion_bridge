@@ -545,14 +545,14 @@ def _build_steps(videos, props):
     steps.append(wrap("STEP_1_OK", "Step 1 — Motion Extraction",
         "PRIMARY estimator: 4D-Humans (HMR2) — outputs real SMPL rotations.\n"
         "Run via subprocess:\n"
-        "  PYTORCH_ENABLE_MPS_FALLBACK=1 ~/hmr2_env/bin/python \\\n"
+        "  PYTORCH_ENABLE_MPS_FALLBACK=1 ~/Desktop/OUTIL/video_mocap_mcp/envs/hmr2_env/bin/python \\\n"
         "    estimator/run_4dhumans.py --video <path> --out <path>.npz\n"
         "Run for EACH video / crop separately.\n"
         "Output: .npz with smpl_poses (N,72) axis-angle rotations for 24 joints,\n"
         "  smpl_betas (10,) body shape, smpl_trans (N,3) camera translation.\n"
         "These are REAL SMPL rotations from a trained neural network, not IK.\n\n"
         "FALLBACK if HMR2 fails:\n"
-        "  ~/mp_env/bin/python estimator/run_mediapipe_ik.py \\\n"
+        "  ~/Desktop/OUTIL/video_mocap_mcp/envs/mp_env/bin/python estimator/run_mediapipe_ik.py \\\n"
         "    --video <path> --out <path>.npz\n\n"
         "IMPORTANT: HMR2 outputs are in SMPL coordinate system (Y-up).\n"
         "The axis conversion to Blender is handled in Step 3 using the\n"
@@ -908,8 +908,8 @@ class VMMCP_PT_panel(Panel):
 
         layout.separator()
         info = layout.box()
-        info.label(text="Primary: 4D-Humans HMR2 (~/hmr2_env)", icon="ARMATURE_DATA")
-        info.label(text="Fallback: MediaPipe IK (~/mp_env)")
+        info.label(text="Primary: 4D-Humans HMR2 (~/Desktop/OUTIL/video_mocap_mcp/envs/hmr2_env)", icon="ARMATURE_DATA")
+        info.label(text="Fallback: MediaPipe IK (~/Desktop/OUTIL/video_mocap_mcp/envs/mp_env)")
 
 
 # ------------------------------------------------------------------
